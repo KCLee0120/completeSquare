@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+	<title>Completing the Square Practice</title>
+	<script
+			src="https://ajax.googleapis.com/ajax/libs/jquery/3.3.1/jquery.min.js"></script>
+	<script src='https://cdn.mathjax.org/mathjax/latest/MathJax.js?config=TeX-AMS-MML_HTMLorMML'></script>
+	<script type="text/x-mathjax-config">
+		MathJax.Hub.Config({
+			tex2jax: {inlineMath: [["$","$"],["\\(","\\)"]]}
+		});
+	</script>
+  <script src="completingS.js"></script>
+
+</head>
+
+<body>
+  <p style="font-size:20px;"><strong>Completing the Square Exercise </strong></p>
+  <p style="font-size:16px;">Rewrite the following quadratic function in the form of $y=a(x-h)^2+k$.</p>
+
+  <div id="questions"></div>
+
+	<br><button onclick="showAnswers()">Show solution</button>
+	<button onclick="showQuestion()">Reset</button>
+	<div id="answers" ></div>
+
+  <script>showQuestion();</script>
+
+</body>
+
+</html>
