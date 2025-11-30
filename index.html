@@ -11,7 +11,7 @@
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.0.2/firebase-app.js";
         import { getAnalytics } from "https://www.gstatic.com/firebasejs/11.0.2/firebase-analytics.js";
-        import { getDatabase, ref, set, onValue, update, remove, onDisconnect, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.0.2/firebase-database.js";
+        import { getDatabase, ref, set, onValue, update, remove, onDisconnect, serverTimestamp, get } from "https://www.gstatic.com/firebasejs/11.0.2/firebase-database.js";
 
         // ==========================================
         // 1. Firebase 設定
@@ -49,15 +49,18 @@
         let bidInterval = null;
         let isHost = false; 
         let currentGameState = null;
-        let localBiddingStartTime = 0; // 本地緩存競價開始時間
+        let localBiddingStartTime = 0; 
+        let cachedPlayerList = []; // 緩存玩家列表供渲染使用
         
-        const TOTAL_ROUNDS = 19;
-        const INITIAL_TIME = 600.0;
+        // 預設值，實際會從 gameState.config 讀取
+        let GAME_CONFIG = {
+            totalRounds: 19,
+            initialTimeMinutes: 10
+        };
         
-        // Host 設定的時間常數
-        const ROUND_LINGER_TIME = 3; // 回合結束後停留在遊戲畫面的秒數
-        const RESULT_SHOW_TIME = 5;  // 結果畫面的展示秒數
-        const TOTAL_RESULT_PHASE_TIME = ROUND_LINGER_TIME + RESULT_SHOW_TIME; // 總共 8 秒
+        const ROUND_LINGER_TIME = 3; 
+        const RESULT_SHOW_TIME = 5;  
+        const TOTAL_RESULT_PHASE_TIME = ROUND_LINGER_TIME + RESULT_SHOW_TIME;
         
         const screens = {
             get login() { return document.getElementById('screen-login'); },
@@ -81,7 +84,8 @@
                 id: myId,
                 nickname: myName,
                 isReady: false,
-                remainingTime: INITIAL_TIME,
+                remainingTime: GAME_CONFIG.initialTimeMinutes * 60, // 暫時寫入，開始時會由 Host 重置
+                score: 0,
                 currentBid: 0,
                 isHolding: false,
                 hasLockedBid: false, 
@@ -111,13 +115,45 @@
             }
         };
 
-        const handleHostStartGame = () => {
+        // Host 修改設定
+        window.updateGameConfig = (type, value) => {
+            if (!isHost) return;
+            const updates = {};
+            if (type === 'time') {
+                updates['gameState/config/initialTimeMinutes'] = parseInt(value);
+            } else if (type === 'rounds') {
+                updates['gameState/config/totalRounds'] = parseInt(value);
+            }
+            update(ref(db), updates);
+        };
+
+        // Host 開始遊戲
+        const handleHostStartGame = async () => {
             if (!isHost) return;
             console.log("Host starting game...");
-            update(ref(db, 'gameState'), { 
-                phase: 'LOBBY_COUNTDOWN',
-                startTime: Date.now()
+            
+            // 1. 讀取當前設定
+            const configSnap = await get(ref(db, 'gameState/config'));
+            const config = configSnap.val() || GAME_CONFIG;
+            const startSeconds = config.initialTimeMinutes * 60;
+
+            // 2. 重置所有玩家的狀態 (時間、分數)
+            const updates = {};
+            cachedPlayerList.forEach(p => {
+                updates[`players/${p.id}/remainingTime`] = startSeconds;
+                updates[`players/${p.id}/score`] = 0;
+                updates[`players/${p.id}/currentBid`] = 0;
+                updates[`players/${p.id}/isHolding`] = false;
+                updates[`players/${p.id}/hasLockedBid`] = false;
+                // 不重置 isReady 以免狀態跳動
             });
+            
+            // 3. 設定遊戲狀態
+            updates['gameState/phase'] = 'LOBBY_COUNTDOWN';
+            updates['gameState/startTime'] = serverTimestamp(); // 使用 serverTimestamp 確保同步
+            updates['gameState/round'] = 1;
+
+            await update(ref(db), updates);
         };
 
         const bindEvents = () => {
@@ -162,6 +198,7 @@
             const gameStateRef = ref(db, 'gameState');
             const playersRef = ref(db, 'players');
 
+            // 監聽玩家列表
             onValue(playersRef, (snapshot) => {
                 const players = snapshot.val() || {};
                 
@@ -171,46 +208,81 @@
                     return tA - tB;
                 });
                 
+                cachedPlayerList = playerList; // 更新緩存
+
+                // Host 判斷
                 if (playerList.length > 0 && playerList[0].id === myId) {
                     isHost = true;
-                    const hostInd = document.getElementById('host-indicator');
-                    if (hostInd) hostInd.classList.remove('hidden');
+                    document.getElementById('host-indicator').classList.remove('hidden');
+                    // 啟用設定輸入框
+                    enableConfigInputs(true);
                 } else {
                     isHost = false;
-                    const hostInd = document.getElementById('host-indicator');
-                    if (hostInd) hostInd.classList.add('hidden');
+                    document.getElementById('host-indicator').classList.add('hidden');
+                    enableConfigInputs(false);
                 }
 
                 const me = playerList.find(p => p.id === myId);
-                if (me) {
-                    updateReadyButton(me.isReady);
-                }
+                if (me) updateReadyButton(me.isReady);
 
                 renderLobbyList(playerList);
                 updateHostStartButton(playerList);
                 checkLobbyAbort(playerList);
                 checkRoundLogic(playerList); 
-                renderScoreboard(playerList);
+                renderScoreboard(playerList); // 即時更新分數
             });
 
+            // 監聽遊戲狀態
             onValue(gameStateRef, (snapshot) => {
                 const state = snapshot.val();
                 if (!state) {
                     if (isHost) {
+                        // 初始化預設設定
                         set(gameStateRef, {
                             phase: 'LOBBY',
                             round: 1,
-                            roundStartTime: 0
+                            config: {
+                                totalRounds: 19,
+                                initialTimeMinutes: 10
+                            }
                         });
                     }
                     return;
                 }
                 
                 currentGameState = state;
+                
+                // 同步設定到全域變數 (如果有的話)
+                if (state.config) {
+                    GAME_CONFIG = state.config;
+                    updateConfigUI(state.config);
+                }
+
                 handleStateChange(state);
             });
         }
         
+        function enableConfigInputs(enabled) {
+            document.getElementById('conf-time').disabled = !enabled;
+            document.getElementById('conf-rounds').disabled = !enabled;
+            const inputs = document.querySelectorAll('.conf-input');
+            inputs.forEach(el => {
+                if(enabled) {
+                    el.classList.remove('opacity-50', 'cursor-not-allowed');
+                } else {
+                    el.classList.add('opacity-50', 'cursor-not-allowed');
+                }
+            });
+        }
+
+        function updateConfigUI(config) {
+            const timeInput = document.getElementById('conf-time');
+            const roundInput = document.getElementById('conf-rounds');
+            // 只有當沒有 focus 時才更新數值，避免打字被打斷
+            if (document.activeElement !== timeInput) timeInput.value = config.initialTimeMinutes;
+            if (document.activeElement !== roundInput) roundInput.value = config.totalRounds;
+        }
+
         // ==========================================
         // 5. Game Loop
         // ==========================================
@@ -226,12 +298,10 @@
                 if (state.phase === 'LOBBY_COUNTDOWN') {
                     const elapsed = (now - startTime) / 1000;
                     const count = 3 - elapsed;
-                    
                     const el = document.getElementById('lobby-status');
                     if (el) el.innerText = `遊戲即將開始... ${Math.max(0, Math.ceil(count))}`;
                     
                     if (isHost && count <= 0) {
-                        console.log("Starting Round 1...");
                         update(ref(db, 'gameState'), { phase: 'ROUND_PREP', round: 1 });
                         resetPlayersForRound();
                     }
@@ -241,12 +311,10 @@
                 else if (state.phase === 'ROUND_COUNTDOWN') {
                     const elapsed = (now - startTime) / 1000;
                     const count = 5 - elapsed;
-                    
                     const el = document.getElementById('game-status-text');
                     if (el) el.innerText = `準備倒數 (鬆手 = 放棄本局)\n${Math.max(0, Math.ceil(count))}`;
                     
                     if (isHost && count <= 0) {
-                        console.log("Starting Bidding...");
                         update(ref(db, 'gameState'), { phase: 'BIDDING', biddingStartTime: Date.now() });
                     }
                 }
@@ -254,20 +322,13 @@
                 // 3. 回合結果 (含 Linger + Show)
                 else if (state.phase === 'ROUND_RESULT') {
                     const elapsed = (now - startTime) / 1000;
-                    // Host 使用總時間 8秒
                     const totalRemaining = TOTAL_RESULT_PHASE_TIME - elapsed;
                     
-                    // Client 倒數顯示 (針對結果畫面的倒數)
-                    // 如果還在 Linger 階段，不需要顯示這個倒數
                     const el = document.getElementById('result-timer-text');
-                    if (el) {
-                        // 這裡顯示的是距離下一局還有多久
-                        el.innerText = `NEXT ROUND IN ${Math.max(0, Math.ceil(totalRemaining))}...`;
-                    }
+                    if (el) el.innerText = `NEXT ROUND IN ${Math.max(0, Math.ceil(totalRemaining))}...`;
                     
                     if (isHost && totalRemaining <= 0) {
-                         console.log("Next Round...");
-                         if (state.round >= TOTAL_ROUNDS) {
+                         if (state.round >= GAME_CONFIG.totalRounds) { // 使用動態總回合數
                             update(ref(db, 'gameState'), { phase: 'GAME_OVER' });
                         } else {
                             update(ref(db, 'gameState'), { phase: 'ROUND_PREP', round: state.round + 1 });
@@ -283,7 +344,7 @@
         function handleStateChange(state) {
             if (!state || !state.phase) return;
 
-            // 畫面切換邏輯 (特別處理 ROUND_RESULT 的延遲)
+            // 畫面切換
             if (state.phase === 'LOBBY' || state.phase === 'LOBBY_COUNTDOWN') {
                 showScreen('lobby');
                 if (state.phase === 'LOBBY') {
@@ -293,33 +354,36 @@
             } else if (state.phase === 'GAME_OVER') {
                 showScreen('result');
                 document.getElementById('round-winner-text').innerHTML = "遊戲結束<br>Game Over";
+                // 隱藏倒數
+                const timerEl = document.getElementById('result-timer-text');
+                if(timerEl) timerEl.classList.add('hidden');
+                
+                // 重新渲染積分板以顯示淘汰者 (確保最後分數已同步)
+                renderScoreboard(cachedPlayerList);
+
             } else if (state.phase === 'ROUND_RESULT') {
-                // 收到結果信號：
-                // 1. 停止計時器 (凍結在最後時刻)
                 stopLocalTimer();
-                // 計算凍結時間：(RoundEndTime - BiddingStartTime)
                 if (localBiddingStartTime > 0) {
                     const finalTime = (state.startTime - localBiddingStartTime) / 1000;
                     document.getElementById('bid-timer').innerText = finalTime.toFixed(1);
                 }
 
-                // 2. 延遲切換到結果畫面 (Linger)
-                // 保持在 Game 畫面 3 秒，然後切到 Result
-                showScreen('game'); // 確保還在 Game
+                showScreen('game'); 
                 setTimeout(() => {
-                    // 再次檢查狀態，防止已經進入下一局了
                     if (currentGameState && currentGameState.phase === 'ROUND_RESULT') {
                         showScreen('result');
+                        // 恢復倒數顯示
+                        const timerEl = document.getElementById('result-timer-text');
+                        if(timerEl) timerEl.classList.remove('hidden');
                     }
-                }, ROUND_LINGER_TIME * 1000); // 3000ms
+                }, ROUND_LINGER_TIME * 1000);
 
             } else {
-                // 其他狀態 (PREP, COUNTDOWN, BIDDING) 直接切換到 Game
                 showScreen('game');
             }
 
             const roundDisplay = document.getElementById('round-display');
-            if (roundDisplay) roundDisplay.innerText = `Round ${state.round || 1} / ${TOTAL_ROUNDS}`;
+            if (roundDisplay) roundDisplay.innerText = `Round ${state.round || 1} / ${GAME_CONFIG.totalRounds}`;
 
             const statusText = document.getElementById('game-status-text');
             const mainBtn = document.getElementById('main-btn');
@@ -345,7 +409,6 @@
                     statusText.innerText = "競價中！鬆手出價";
                     statusText.className = "text-xl text-green-400 font-bold animate-pulse";
                     mainBtn.innerText = "放手出價 (RELEASE)";
-                    // 記錄開始時間供後續計算
                     if (state.biddingStartTime) {
                         localBiddingStartTime = state.biddingStartTime;
                         startLocalTimer(state.biddingStartTime);
@@ -363,7 +426,6 @@
             e.preventDefault(); 
             if (!currentGameState) return;
             const state = currentGameState;
-            
             if (state.phase === 'ROUND_PREP') {
                 update(ref(db, `players/${myId}`), { isHolding: true });
             }
@@ -383,11 +445,9 @@
                     hasLockedBid: true,
                     currentBid: 0 
                 });
-                // 這裡停止計時器也沒關係，因為 BIDDING 會統一重啟
                 stopLocalTimer();
             }
             else if (state.phase === 'BIDDING') {
-                // 出價：使用絕對時間差計算，不依賴介面數字
                 const bidStart = state.biddingStartTime || localBiddingStartTime;
                 const finalBid = (Date.now() - bidStart) / 1000;
                 
@@ -409,10 +469,6 @@
                         currentBid: validBid,
                         remainingTime: newRemaining
                     });
-                    
-                    // 關鍵修改：鬆手後 *不* 停止計時器
-                    // stopLocalTimer(); <--- 移除這行
-                    
                 }, { onlyOnce: true });
             }
         };
@@ -428,11 +484,9 @@
         function startLocalTimer(startTime) {
             if (bidInterval) clearInterval(bidInterval);
             const timerEl = document.getElementById('bid-timer');
-            
             bidInterval = setInterval(() => {
                 const now = Date.now();
                 const delta = (now - startTime) / 1000;
-                // 更新顯示
                 if (timerEl) timerEl.innerText = delta.toFixed(1);
             }, 50);
         }
@@ -442,12 +496,10 @@
             bidInterval = null;
         }
 
-        // 確保重新連線或重整時能恢復計時
         if (db) {
             onValue(ref(db, 'gameState'), (snap) => {
                 const state = snap.val();
                 if (state && state.phase === 'BIDDING') {
-                    // 不需要檢查 isHolding，只要是 BIDDING 就跑計時
                     localBiddingStartTime = state.biddingStartTime;
                     startLocalTimer(state.biddingStartTime);
                 }
@@ -464,9 +516,7 @@
 
             if (isHost) {
                 btn.classList.remove('hidden');
-                
                 const allReady = playerList.length >= 2 && playerList.every(p => p.isReady);
-                
                 if (allReady) {
                     btn.disabled = false;
                     btn.classList.remove('opacity-50', 'cursor-not-allowed');
@@ -485,7 +535,6 @@
         function checkLobbyAbort(playerList) {
             if (!isHost) return;
             const allReady = playerList.length >= 2 && playerList.every(p => p.isReady);
-            
             if (currentGameState && currentGameState.phase === 'LOBBY_COUNTDOWN' && !allReady) {
                 update(ref(db, 'gameState'), { phase: 'LOBBY' });
             }
@@ -496,12 +545,10 @@
             if (!currentGameState) return;
             const state = currentGameState;
             
-            // 準備階段：全員按住 -> 倒數
             if (state.phase === 'ROUND_PREP') {
                 const activePlayers = playerList.filter(p => p.remainingTime > 0);
                 const allHolding = activePlayers.length > 0 && activePlayers.every(p => p.isHolding);
                 if (allHolding) {
-                    console.log("All holding, starting countdown...");
                     update(ref(db, 'gameState'), { 
                         phase: 'ROUND_COUNTDOWN',
                         startTime: Date.now()
@@ -509,7 +556,6 @@
                 }
             }
             
-            // 競價階段：全員出價完畢 -> 結算
             if (state.phase === 'BIDDING') {
                  const activePlayers = playerList.filter(p => p.remainingTime > 0);
                  const allFinished = activePlayers.every(p => p.hasLockedBid);
@@ -519,7 +565,7 @@
             }
         }
 
-        function determineWinner(players) {
+        async function determineWinner(players) {
             const sorted = players.sort((a,b) => b.currentBid - a.currentBid);
             let winnerId = null;
             let maxBid = -1;
@@ -533,18 +579,20 @@
                 }
             }
             
-            update(ref(db, 'gameState'), { 
-                phase: 'ROUND_RESULT',
-                startTime: Date.now(),
-                lastWinnerId: winnerId,
-                lastWinnerBid: maxBid
-            });
-            
+            // 重要：先更新分數，再更新狀態，確保客戶端能拿到最新分數
             if (winnerId) {
                 const winner = players.find(p => p.id === winnerId);
                 const currentScore = winner.score || 0;
-                update(ref(db, `players/${winnerId}`), { score: currentScore + 1 });
+                await update(ref(db, `players/${winnerId}`), { score: currentScore + 1 });
             }
+
+            // 更新狀態
+            await update(ref(db, 'gameState'), { 
+                phase: 'ROUND_RESULT',
+                startTime: Date.now(), // 這裡使用本地時間即可，誤差影響不大
+                lastWinnerId: winnerId,
+                lastWinnerBid: maxBid
+            });
         }
 
         function resetPlayersForRound() {
@@ -590,6 +638,7 @@
         }
         
         function renderScoreboard(list) {
+            // 遊戲內小分數板
             const container = document.getElementById('ingame-scoreboard');
             if (container) {
                 container.innerHTML = list.map(p => `
@@ -600,6 +649,7 @@
                 `).join('');
             }
 
+            // 結算畫面詳細列表
             const resultContainer = document.getElementById('result-list');
             if (currentGameState && (currentGameState.phase === 'ROUND_RESULT' || currentGameState.phase === 'GAME_OVER') && resultContainer) {
                  const winnerId = currentGameState.lastWinnerId;
@@ -607,7 +657,7 @@
                  const sortedByScore = [...list].sort((a, b) => (b.score || 0) - (a.score || 0));
 
                  const winnerText = document.getElementById('round-winner-text');
-                 if (winnerText) {
+                 if (winnerText && currentGameState.phase === 'ROUND_RESULT') {
                      if (winnerId) {
                          const winner = list.find(p => p.id === winnerId);
                          winnerText.innerHTML = 
@@ -627,6 +677,20 @@
                         <span class="font-mono text-yellow-600">${p.score || 0} pts</span>
                     </div>
                  `).join('');
+
+                 // 新增：顯示淘汰者 (僅在 GAME_OVER 時)
+                 const loserContainer = document.getElementById('loser-container');
+                 if (currentGameState.phase === 'GAME_OVER' && loserContainer) {
+                     loserContainer.classList.remove('hidden');
+                     // 找出最低分
+                     const minScore = sortedByScore[sortedByScore.length - 1].score || 0;
+                     // 篩選出所有最低分的玩家
+                     const losers = sortedByScore.filter(p => (p.score || 0) === minScore);
+                     const loserNames = losers.map(p => p.nickname).join(', ');
+                     document.getElementById('loser-text').innerText = loserNames;
+                 } else if (loserContainer) {
+                     loserContainer.classList.add('hidden');
+                 }
             }
         }
 
@@ -643,6 +707,10 @@
         @keyframes fadeIn {
             from { opacity: 0; }
             to { opacity: 1; }
+        }
+        /* 美化 Input Number */
+        input[type=number]::-webkit-inner-spin-button {
+            opacity: 1;
         }
     </style>
 </head>
@@ -667,6 +735,25 @@
             </button>
             <h2 class="text-xl font-bold text-gray-300">LOBBY</h2>
             <span id="host-indicator" class="hidden text-xs bg-yellow-900 text-yellow-200 px-2 py-1 rounded">YOU ARE HOST</span>
+        </div>
+        
+        <!-- Game Settings (New) -->
+        <div class="bg-zinc-900 p-4 rounded-lg border border-zinc-800 mb-4">
+            <h3 class="text-xs text-gray-500 mb-3 uppercase tracking-wider">Game Settings</h3>
+            <div class="grid grid-cols-2 gap-4">
+                <div>
+                    <label class="block text-gray-400 text-xs mb-1">TIME (MINS)</label>
+                    <input type="number" id="conf-time" min="5" max="10" value="10" 
+                           onchange="updateGameConfig('time', this.value)"
+                           class="conf-input w-full bg-black text-white p-2 rounded border border-gray-700 text-center font-mono focus:border-yellow-500 outline-none">
+                </div>
+                <div>
+                    <label class="block text-gray-400 text-xs mb-1">ROUNDS</label>
+                    <input type="number" id="conf-rounds" min="9" max="19" value="19"
+                           onchange="updateGameConfig('rounds', this.value)" 
+                           class="conf-input w-full bg-black text-white p-2 rounded border border-gray-700 text-center font-mono focus:border-yellow-500 outline-none">
+                </div>
+            </div>
         </div>
         
         <div id="lobby-status" class="text-center text-yellow-500 text-lg mb-4 font-mono h-8">WAITING FOR PLAYERS...</div>
@@ -720,12 +807,20 @@
             </div>
         </div>
         
-        <!-- 新增倒數提示 -->
         <p id="result-timer-text" class="text-white/50 text-xs mb-4 animate-pulse">NEXT ROUND IN 5...</p>
 
         <div class="w-full max-w-md bg-zinc-900 p-4 rounded border border-zinc-700">
             <h3 class="text-xs text-gray-500 mb-2 uppercase">Current Standings</h3>
-            <div id="result-list" class="space-y-2">
+            <div id="result-list" class="space-y-2 mb-4">
+                <!-- Standings -->
+            </div>
+
+            <!-- 淘汰者顯示區塊 (新增) -->
+            <div id="loser-container" class="hidden mt-4 pt-4 border-t border-zinc-700 text-center">
+                <h3 class="text-xs text-red-500 mb-1 uppercase tracking-widest">ELIMINATED</h3>
+                <div id="loser-text" class="text-xl font-bold text-red-600">
+                    <!-- Loser Name -->
+                </div>
             </div>
         </div>
     </div>
