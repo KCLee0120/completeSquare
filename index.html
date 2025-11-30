@@ -50,7 +50,7 @@
         let isHost = false; 
         let currentGameState = null;
         let localBiddingStartTime = 0; 
-        let cachedPlayerList = []; // 緩存玩家列表供渲染使用
+        let cachedPlayerList = []; 
         
         // 預設值，實際會從 gameState.config 讀取
         let GAME_CONFIG = {
@@ -84,11 +84,12 @@
                 id: myId,
                 nickname: myName,
                 isReady: false,
-                remainingTime: GAME_CONFIG.initialTimeMinutes * 60, // 暫時寫入，開始時會由 Host 重置
+                remainingTime: GAME_CONFIG.initialTimeMinutes * 60, 
                 score: 0,
                 currentBid: 0,
                 isHolding: false,
                 hasLockedBid: false, 
+                bidHistory: {}, // 初始化歷史記錄
                 joinedAt: serverTimestamp()
             });
 
@@ -115,7 +116,6 @@
             }
         };
 
-        // Host 修改設定
         window.updateGameConfig = (type, value) => {
             if (!isHost) return;
             const updates = {};
@@ -127,17 +127,14 @@
             update(ref(db), updates);
         };
 
-        // Host 開始遊戲
         const handleHostStartGame = async () => {
             if (!isHost) return;
             console.log("Host starting game...");
             
-            // 1. 讀取當前設定
             const configSnap = await get(ref(db, 'gameState/config'));
             const config = configSnap.val() || GAME_CONFIG;
             const startSeconds = config.initialTimeMinutes * 60;
 
-            // 2. 重置所有玩家的狀態 (時間、分數)
             const updates = {};
             cachedPlayerList.forEach(p => {
                 updates[`players/${p.id}/remainingTime`] = startSeconds;
@@ -145,12 +142,11 @@
                 updates[`players/${p.id}/currentBid`] = 0;
                 updates[`players/${p.id}/isHolding`] = false;
                 updates[`players/${p.id}/hasLockedBid`] = false;
-                // 不重置 isReady 以免狀態跳動
+                updates[`players/${p.id}/bidHistory`] = null; // 清空歷史
             });
             
-            // 3. 設定遊戲狀態
             updates['gameState/phase'] = 'LOBBY_COUNTDOWN';
-            updates['gameState/startTime'] = serverTimestamp(); // 使用 serverTimestamp 確保同步
+            updates['gameState/startTime'] = serverTimestamp();
             updates['gameState/round'] = 1;
 
             await update(ref(db), updates);
@@ -198,7 +194,6 @@
             const gameStateRef = ref(db, 'gameState');
             const playersRef = ref(db, 'players');
 
-            // 監聽玩家列表
             onValue(playersRef, (snapshot) => {
                 const players = snapshot.val() || {};
                 
@@ -208,13 +203,11 @@
                     return tA - tB;
                 });
                 
-                cachedPlayerList = playerList; // 更新緩存
+                cachedPlayerList = playerList;
 
-                // Host 判斷
                 if (playerList.length > 0 && playerList[0].id === myId) {
                     isHost = true;
                     document.getElementById('host-indicator').classList.remove('hidden');
-                    // 啟用設定輸入框
                     enableConfigInputs(true);
                 } else {
                     isHost = false;
@@ -229,15 +222,13 @@
                 updateHostStartButton(playerList);
                 checkLobbyAbort(playerList);
                 checkRoundLogic(playerList); 
-                renderScoreboard(playerList); // 即時更新分數
+                renderScoreboard(playerList);
             });
 
-            // 監聽遊戲狀態
             onValue(gameStateRef, (snapshot) => {
                 const state = snapshot.val();
                 if (!state) {
                     if (isHost) {
-                        // 初始化預設設定
                         set(gameStateRef, {
                             phase: 'LOBBY',
                             round: 1,
@@ -252,7 +243,6 @@
                 
                 currentGameState = state;
                 
-                // 同步設定到全域變數 (如果有的話)
                 if (state.config) {
                     GAME_CONFIG = state.config;
                     updateConfigUI(state.config);
@@ -278,7 +268,6 @@
         function updateConfigUI(config) {
             const timeInput = document.getElementById('conf-time');
             const roundInput = document.getElementById('conf-rounds');
-            // 只有當沒有 focus 時才更新數值，避免打字被打斷
             if (document.activeElement !== timeInput) timeInput.value = config.initialTimeMinutes;
             if (document.activeElement !== roundInput) roundInput.value = config.totalRounds;
         }
@@ -294,7 +283,6 @@
                 const state = currentGameState;
                 const startTime = state.startTime || state.biddingStartTime || now;
 
-                // 1. 大廳倒數
                 if (state.phase === 'LOBBY_COUNTDOWN') {
                     const elapsed = (now - startTime) / 1000;
                     const count = 3 - elapsed;
@@ -306,8 +294,6 @@
                         resetPlayersForRound();
                     }
                 } 
-                
-                // 2. 回合緩衝倒數
                 else if (state.phase === 'ROUND_COUNTDOWN') {
                     const elapsed = (now - startTime) / 1000;
                     const count = 5 - elapsed;
@@ -318,8 +304,6 @@
                         update(ref(db, 'gameState'), { phase: 'BIDDING', biddingStartTime: Date.now() });
                     }
                 }
-
-                // 3. 回合結果 (含 Linger + Show)
                 else if (state.phase === 'ROUND_RESULT') {
                     const elapsed = (now - startTime) / 1000;
                     const totalRemaining = TOTAL_RESULT_PHASE_TIME - elapsed;
@@ -328,7 +312,7 @@
                     if (el) el.innerText = `NEXT ROUND IN ${Math.max(0, Math.ceil(totalRemaining))}...`;
                     
                     if (isHost && totalRemaining <= 0) {
-                         if (state.round >= GAME_CONFIG.totalRounds) { // 使用動態總回合數
+                         if (state.round >= GAME_CONFIG.totalRounds) {
                             update(ref(db, 'gameState'), { phase: 'GAME_OVER' });
                         } else {
                             update(ref(db, 'gameState'), { phase: 'ROUND_PREP', round: state.round + 1 });
@@ -344,7 +328,6 @@
         function handleStateChange(state) {
             if (!state || !state.phase) return;
 
-            // 畫面切換
             if (state.phase === 'LOBBY' || state.phase === 'LOBBY_COUNTDOWN') {
                 showScreen('lobby');
                 if (state.phase === 'LOBBY') {
@@ -354,11 +337,9 @@
             } else if (state.phase === 'GAME_OVER') {
                 showScreen('result');
                 document.getElementById('round-winner-text').innerHTML = "遊戲結束<br>Game Over";
-                // 隱藏倒數
                 const timerEl = document.getElementById('result-timer-text');
                 if(timerEl) timerEl.classList.add('hidden');
                 
-                // 重新渲染積分板以顯示淘汰者 (確保最後分數已同步)
                 renderScoreboard(cachedPlayerList);
 
             } else if (state.phase === 'ROUND_RESULT') {
@@ -372,7 +353,6 @@
                 setTimeout(() => {
                     if (currentGameState && currentGameState.phase === 'ROUND_RESULT') {
                         showScreen('result');
-                        // 恢復倒數顯示
                         const timerEl = document.getElementById('result-timer-text');
                         if(timerEl) timerEl.classList.remove('hidden');
                     }
@@ -579,20 +559,30 @@
                 }
             }
             
-            // 重要：先更新分數，再更新狀態，確保客戶端能拿到最新分數
+            // 使用 Atomic Updates 一次性更新所有資料（分數、歷史記錄、狀態）
+            const updates = {};
+            const round = currentGameState.round;
+            const startTime = Date.now();
+
+            // 1. 記錄歷史 & 分數
+            players.forEach(p => {
+                // 記錄本回合出價
+                updates[`players/${p.id}/bidHistory/${round}`] = p.currentBid || 0;
+            });
+
             if (winnerId) {
                 const winner = players.find(p => p.id === winnerId);
                 const currentScore = winner.score || 0;
-                await update(ref(db, `players/${winnerId}`), { score: currentScore + 1 });
+                updates[`players/${winnerId}/score`] = currentScore + 1;
             }
 
-            // 更新狀態
-            await update(ref(db, 'gameState'), { 
-                phase: 'ROUND_RESULT',
-                startTime: Date.now(), // 這裡使用本地時間即可，誤差影響不大
-                lastWinnerId: winnerId,
-                lastWinnerBid: maxBid
-            });
+            // 2. 更新遊戲狀態
+            updates['gameState/phase'] = 'ROUND_RESULT';
+            updates['gameState/startTime'] = startTime;
+            updates['gameState/lastWinnerId'] = winnerId;
+            updates['gameState/lastWinnerBid'] = maxBid;
+
+            await update(ref(db), updates);
         }
 
         function resetPlayersForRound() {
@@ -638,7 +628,6 @@
         }
         
         function renderScoreboard(list) {
-            // 遊戲內小分數板
             const container = document.getElementById('ingame-scoreboard');
             if (container) {
                 container.innerHTML = list.map(p => `
@@ -649,7 +638,6 @@
                 `).join('');
             }
 
-            // 結算畫面詳細列表
             const resultContainer = document.getElementById('result-list');
             if (currentGameState && (currentGameState.phase === 'ROUND_RESULT' || currentGameState.phase === 'GAME_OVER') && resultContainer) {
                  const winnerId = currentGameState.lastWinnerId;
@@ -678,20 +666,58 @@
                     </div>
                  `).join('');
 
-                 // 新增：顯示淘汰者 (僅在 GAME_OVER 時)
+                 // 淘汰者顯示
                  const loserContainer = document.getElementById('loser-container');
-                 if (currentGameState.phase === 'GAME_OVER' && loserContainer) {
-                     loserContainer.classList.remove('hidden');
-                     // 找出最低分
-                     const minScore = sortedByScore[sortedByScore.length - 1].score || 0;
-                     // 篩選出所有最低分的玩家
-                     const losers = sortedByScore.filter(p => (p.score || 0) === minScore);
-                     const loserNames = losers.map(p => p.nickname).join(', ');
-                     document.getElementById('loser-text').innerText = loserNames;
-                 } else if (loserContainer) {
-                     loserContainer.classList.add('hidden');
+                 const historyContainer = document.getElementById('history-container');
+                 
+                 if (currentGameState.phase === 'GAME_OVER') {
+                     // 1. 顯示淘汰者
+                     if (loserContainer) {
+                         loserContainer.classList.remove('hidden');
+                         const minScore = sortedByScore[sortedByScore.length - 1].score || 0;
+                         const losers = sortedByScore.filter(p => (p.score || 0) === minScore);
+                         const loserNames = losers.map(p => p.nickname).join(', ');
+                         document.getElementById('loser-text').innerText = loserNames;
+                     }
+                     // 2. 顯示詳細戰績表
+                     if (historyContainer) {
+                         historyContainer.classList.remove('hidden');
+                         renderHistoryTable(list, GAME_CONFIG.totalRounds);
+                     }
+                 } else {
+                     if (loserContainer) loserContainer.classList.add('hidden');
+                     if (historyContainer) historyContainer.classList.add('hidden');
                  }
             }
+        }
+
+        function renderHistoryTable(players, totalRounds) {
+             const tableBody = document.getElementById('history-table-body');
+             const tableHead = document.getElementById('history-table-head');
+             if (!tableBody || !tableHead) return;
+
+             // 1. 建立表頭 (R1, R2...)
+             let headHtml = `<th class="px-2 py-1 sticky left-0 bg-gray-700 z-10 text-yellow-500">Player</th>`;
+             headHtml += `<th class="px-2 py-1 bg-gray-700 min-w-[80px]">Rem. Time</th>`;
+             for(let i=1; i<=totalRounds; i++) {
+                 headHtml += `<th class="px-2 py-1 bg-gray-700 min-w-[50px]">R${i}</th>`;
+             }
+             tableHead.innerHTML = `<tr>${headHtml}</tr>`;
+
+             // 2. 建立表格內容
+             tableBody.innerHTML = players.map(p => {
+                 let rowHtml = `<td class="px-2 py-1 sticky left-0 bg-gray-800 font-bold text-white border-r border-gray-600">${p.nickname}</td>`;
+                 // 剩餘時間
+                 rowHtml += `<td class="px-2 py-1 text-green-400 font-mono">${(p.remainingTime || 0).toFixed(1)}</td>`;
+                 // 每一回合出價
+                 for(let i=1; i<=totalRounds; i++) {
+                     const bid = p.bidHistory && p.bidHistory[i] ? p.bidHistory[i] : 0;
+                     // 0 出價顯示為灰色 -
+                     const displayBid = bid > 0 ? bid.toFixed(1) : '<span class="text-gray-600">-</span>';
+                     rowHtml += `<td class="px-2 py-1 border-l border-gray-700 font-mono text-gray-300 text-center">${displayBid}</td>`;
+                 }
+                 return `<tr class="border-b border-gray-700 hover:bg-white/5">${rowHtml}</tr>`;
+             }).join('');
         }
 
     </script>
@@ -800,29 +826,48 @@
     </div>
 
     <!-- Result -->
-    <div id="screen-result" class="hidden absolute inset-0 bg-black/90 z-50 flex flex-col items-center justify-center p-6 animate-fade-in">
-        <h2 class="text-gray-400 tracking-[0.5em] text-sm mb-6">ROUND RESULT</h2>
-        <div class="w-64 h-64 rounded-full border-4 border-yellow-500 flex items-center justify-center bg-yellow-900/20 mb-8 shadow-[0_0_50px_rgba(234,179,8,0.3)]">
-            <div id="round-winner-text" class="text-center font-bold">
-            </div>
-        </div>
+    <div id="screen-result" class="hidden absolute inset-0 bg-black/90 z-50 flex flex-col p-6 animate-fade-in overflow-y-auto">
         
-        <p id="result-timer-text" class="text-white/50 text-xs mb-4 animate-pulse">NEXT ROUND IN 5...</p>
-
-        <div class="w-full max-w-md bg-zinc-900 p-4 rounded border border-zinc-700">
-            <h3 class="text-xs text-gray-500 mb-2 uppercase">Current Standings</h3>
-            <div id="result-list" class="space-y-2 mb-4">
-                <!-- Standings -->
+        <div class="w-full max-w-md mx-auto flex flex-col items-center">
+            <h2 class="text-gray-400 tracking-[0.5em] text-sm mb-6 mt-10">ROUND RESULT</h2>
+            <div class="w-64 h-64 rounded-full border-4 border-yellow-500 flex items-center justify-center bg-yellow-900/20 mb-8 shadow-[0_0_50px_rgba(234,179,8,0.3)] shrink-0">
+                <div id="round-winner-text" class="text-center font-bold">
+                </div>
             </div>
+            
+            <p id="result-timer-text" class="text-white/50 text-xs mb-4 animate-pulse">NEXT ROUND IN 5...</p>
 
-            <!-- 淘汰者顯示區塊 (新增) -->
-            <div id="loser-container" class="hidden mt-4 pt-4 border-t border-zinc-700 text-center">
-                <h3 class="text-xs text-red-500 mb-1 uppercase tracking-widest">ELIMINATED</h3>
-                <div id="loser-text" class="text-xl font-bold text-red-600">
-                    <!-- Loser Name -->
+            <div class="w-full bg-zinc-900 p-4 rounded border border-zinc-700 mb-6">
+                <h3 class="text-xs text-gray-500 mb-2 uppercase">Current Standings</h3>
+                <div id="result-list" class="space-y-2 mb-4">
+                    <!-- Standings -->
+                </div>
+
+                <!-- 淘汰者顯示區塊 -->
+                <div id="loser-container" class="hidden mt-4 pt-4 border-t border-zinc-700 text-center">
+                    <h3 class="text-xs text-red-500 mb-1 uppercase tracking-widest">ELIMINATED</h3>
+                    <div id="loser-text" class="text-xl font-bold text-red-600">
+                        <!-- Loser Name -->
+                    </div>
                 </div>
             </div>
         </div>
+
+        <!-- 詳細戰績表 (新增) -->
+        <div id="history-container" class="hidden w-full max-w-4xl mx-auto mt-6 mb-10">
+            <h3 class="text-xs text-gray-500 mb-2 uppercase tracking-widest text-center">Match History</h3>
+            <div class="overflow-x-auto bg-zinc-900 rounded border border-zinc-800 shadow-xl">
+                <table class="w-full text-xs text-left whitespace-nowrap">
+                    <thead id="history-table-head" class="text-gray-400 bg-zinc-800 uppercase">
+                        <!-- Dynamic Header -->
+                    </thead>
+                    <tbody id="history-table-body" class="text-gray-300">
+                        <!-- Dynamic Body -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
     </div>
 
 </body>
