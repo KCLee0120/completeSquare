@@ -100,7 +100,6 @@
                     isHost = false;
                     document.getElementById('host-indicator').classList.add('hidden');
                     
-                    // 重置按鈕狀態
                     updateReadyButton(false);
                 }).catch((error) => {
                     console.error("離開失敗:", error);
@@ -109,10 +108,25 @@
             }
         };
 
+        // Host 手動開始遊戲
+        const handleHostStartGame = () => {
+            if (!isHost) return;
+            // 觸發倒數
+            update(ref(db, 'gameState'), { 
+                phase: 'LOBBY_COUNTDOWN',
+                startTime: Date.now()
+            });
+        };
+
         const bindEvents = () => {
             const leaveBtn = document.getElementById('btn-leave');
             if (leaveBtn) {
                 leaveBtn.addEventListener('click', handleLeaveGame);
+            }
+            // 綁定 Host Start 按鈕
+            const hostStartBtn = document.getElementById('btn-host-start');
+            if (hostStartBtn) {
+                hostStartBtn.addEventListener('click', handleHostStartGame);
             }
         };
         if (document.readyState === 'loading') {
@@ -121,31 +135,25 @@
             bindEvents();
         }
 
-        // 修改：切換準備狀態 (Toggle Ready)
         window.toggleReady = () => {
             const playerRef = ref(db, `players/${myId}/isReady`);
-            // 先讀取當前狀態，再反轉
             onValue(playerRef, (snap) => {
                 const currentStatus = snap.val();
                 update(ref(db, `players/${myId}`), { isReady: !currentStatus });
             }, { onlyOnce: true });
         };
 
-        // 新增：更新按鈕樣式函式
         function updateReadyButton(isReady) {
             const btn = document.getElementById('btn-ready');
             if (!btn) return;
 
             if (isReady) {
-                // 已準備：顯示為取消按鈕
                 btn.innerText = "取消準備 (CANCEL)";
                 btn.className = "w-full bg-zinc-900 border border-red-600 text-red-500 py-4 rounded font-bold tracking-widest uppercase hover:bg-red-900/20 transition-all";
             } else {
-                // 未準備：顯示為準備按鈕
                 btn.innerText = "I AM READY";
                 btn.className = "w-full bg-zinc-800 border border-green-600 text-green-500 py-4 rounded font-bold tracking-widest uppercase hover:bg-green-900/20 transition-all";
             }
-            // 永遠保持可點擊，不使用 disabled
             btn.classList.remove('opacity-50');
             btn.disabled = false;
         }
@@ -168,15 +176,14 @@
                     if (hostInd) hostInd.classList.remove('hidden');
                 }
 
-                // 檢查自己的狀態並更新按鈕
                 const me = playerList.find(p => p.id === myId);
                 if (me) {
                     updateReadyButton(me.isReady);
                 }
 
                 renderLobbyList(playerList);
-                checkLobbyStart(playerList);
-                checkLobbyAbort(playerList); // 新增：檢查是否需要中斷倒數
+                updateHostStartButton(playerList); // 更新 Host 按鈕狀態
+                checkLobbyAbort(playerList);
                 checkRoundLogic(playerList); 
                 renderScoreboard(playerList);
             });
@@ -202,7 +209,6 @@
 
             if (state.phase === 'LOBBY') {
                 showScreen('lobby');
-                // 恢復大廳狀態文字
                 document.getElementById('lobby-status').innerText = "WAITING FOR PLAYERS...";
             } else if (state.phase === 'GAME_OVER') {
                 showScreen('result');
@@ -378,24 +384,31 @@
         // 6. Host 邏輯
         // ==========================================
         
-        function checkLobbyStart(playerList) {
-            if (!isHost) return;
-            const allReady = playerList.length >= 2 && playerList.every(p => p.isReady);
-            
-            onValue(ref(db, 'gameState'), (snap) => {
-                const state = snap.val();
-                if (!state) return;
-                // 只有在 LOBBY 狀態下才發起倒數
-                if (state.phase === 'LOBBY' && allReady) {
-                    update(ref(db, 'gameState'), { 
-                        phase: 'LOBBY_COUNTDOWN',
-                        startTime: Date.now()
-                    });
+        // Host 按鈕更新邏輯
+        function updateHostStartButton(playerList) {
+            const btn = document.getElementById('btn-host-start');
+            if (!btn) return;
+
+            if (isHost) {
+                btn.classList.remove('hidden');
+                
+                const allReady = playerList.length >= 2 && playerList.every(p => p.isReady);
+                
+                if (allReady) {
+                    btn.disabled = false;
+                    btn.classList.remove('opacity-50', 'cursor-not-allowed');
+                    btn.innerText = "START GAME";
+                } else {
+                    btn.disabled = true;
+                    btn.classList.add('opacity-50', 'cursor-not-allowed');
+                    const readyCount = playerList.filter(p=>p.isReady).length;
+                    btn.innerText = `WAITING FOR ALL READY (${readyCount}/${playerList.length})`;
                 }
-            }, { onlyOnce: true });
+            } else {
+                btn.classList.add('hidden');
+            }
         }
 
-        // 新增：檢查倒數中斷
         function checkLobbyAbort(playerList) {
             if (!isHost) return;
             const allReady = playerList.length >= 2 && playerList.every(p => p.isReady);
@@ -598,6 +611,11 @@
         <div id="lobby-player-list" class="flex-1 space-y-2 overflow-y-auto mb-6">
             <!-- List -->
         </div>
+
+        <!-- HOST START BUTTON (新增) -->
+        <button id="btn-host-start" class="hidden w-full mb-4 bg-yellow-600 border border-yellow-400 text-white py-4 rounded font-bold tracking-widest uppercase hover:bg-yellow-700 transition-all shadow-lg shadow-yellow-900/50">
+            START GAME
+        </button>
 
         <button id="btn-ready" onclick="toggleReady()" class="w-full bg-zinc-800 border border-green-600 text-green-500 py-4 rounded font-bold tracking-widest uppercase hover:bg-green-900/20 transition-all">
             I AM READY
