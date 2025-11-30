@@ -50,6 +50,9 @@
         let bidInterval = null;
         let isHost = false; 
         
+        // 新增：儲存最新的遊戲狀態，供 GameLoop 使用
+        let currentGameState = null;
+        
         const TOTAL_ROUNDS = 19;
         const INITIAL_TIME = 600.0;
         
@@ -108,7 +111,6 @@
             }
         };
 
-        // Host 手動開始遊戲
         const handleHostStartGame = () => {
             if (!isHost) return;
             // 觸發倒數
@@ -123,7 +125,6 @@
             if (leaveBtn) {
                 leaveBtn.addEventListener('click', handleLeaveGame);
             }
-            // 綁定 Host Start 按鈕
             const hostStartBtn = document.getElementById('btn-host-start');
             if (hostStartBtn) {
                 hostStartBtn.addEventListener('click', handleHostStartGame);
@@ -159,7 +160,7 @@
         }
 
         // ==========================================
-        // 4. Firebase 監聽與狀態機
+        // 4. Firebase 監聽與 GameLoop
         // ==========================================
 
         if(db) {
@@ -182,7 +183,7 @@
                 }
 
                 renderLobbyList(playerList);
-                updateHostStartButton(playerList); // 更新 Host 按鈕狀態
+                updateHostStartButton(playerList);
                 checkLobbyAbort(playerList);
                 checkRoundLogic(playerList); 
                 renderScoreboard(playerList);
@@ -200,21 +201,82 @@
                     }
                     return;
                 }
+                
+                // 更新全域狀態
+                currentGameState = state;
+                
                 handleStateChange(state);
             });
         }
         
+        // 新增：Game Loop (每 100ms 執行一次)
+        // 負責倒數計時與時間觸發的狀態切換
+        setInterval(() => {
+            if (!currentGameState) return;
+            const now = Date.now();
+            const state = currentGameState;
+
+            // 1. 大廳倒數
+            if (state.phase === 'LOBBY_COUNTDOWN') {
+                const count = 3 - Math.floor((now - state.startTime) / 1000);
+                const el = document.getElementById('lobby-status');
+                if (el) el.innerText = `遊戲即將開始... ${Math.max(0, count)}`;
+                
+                // Host 負責切換狀態
+                if (isHost && count < 0) {
+                    update(ref(db, 'gameState'), { phase: 'ROUND_PREP', round: 1 });
+                    resetPlayersForRound();
+                }
+            } 
+            
+            // 2. 回合緩衝倒數 (5秒)
+            else if (state.phase === 'ROUND_COUNTDOWN') {
+                const count = 5 - Math.floor((now - state.startTime) / 1000);
+                const el = document.getElementById('game-status-text');
+                if (el) el.innerText = `準備倒數 (鬆手 = 放棄本局)\n${Math.max(0, count)}`;
+                
+                // Host 負責切換狀態
+                if (isHost && count < 0) {
+                    update(ref(db, 'gameState'), { phase: 'BIDDING', biddingStartTime: now });
+                }
+            }
+
+            // 3. 回合結果展示倒數 (5秒)
+            else if (state.phase === 'ROUND_RESULT') {
+                const count = 5 - Math.floor((now - state.startTime) / 1000);
+                const el = document.querySelector('#screen-result p');
+                if (el) el.innerText = `NEXT ROUND STARTING IN ${Math.max(0, count)}...`;
+                
+                // Host 負責切換狀態
+                if (isHost && count < 0) {
+                     if (state.round >= TOTAL_ROUNDS) {
+                        update(ref(db, 'gameState'), { phase: 'GAME_OVER' });
+                    } else {
+                        update(ref(db, 'gameState'), { phase: 'ROUND_PREP', round: state.round + 1 });
+                        resetPlayersForRound();
+                    }
+                }
+            }
+        }, 100);
+
         function handleStateChange(state) {
             if (!state || !state.phase) return;
 
-            if (state.phase === 'LOBBY') {
+            // 畫面切換邏輯
+            if (state.phase === 'LOBBY' || state.phase === 'LOBBY_COUNTDOWN') {
                 showScreen('lobby');
-                document.getElementById('lobby-status').innerText = "WAITING FOR PLAYERS...";
+                if (state.phase === 'LOBBY') {
+                    document.getElementById('lobby-status').innerText = "WAITING FOR PLAYERS...";
+                }
             } else if (state.phase === 'GAME_OVER') {
                 showScreen('result');
                 document.getElementById('round-winner-text').innerHTML = "遊戲結束<br>Game Over";
             } else {
                 showScreen('game');
+            }
+            
+            if (state.phase === 'ROUND_RESULT') {
+                showScreen('result');
             }
 
             const roundDisplay = document.getElementById('round-display');
@@ -223,17 +285,8 @@
             const statusText = document.getElementById('game-status-text');
             const mainBtn = document.getElementById('main-btn');
 
+            // 這裡只處理靜態文字與按鈕樣式，動態倒數交給 setInterval
             switch (state.phase) {
-                case 'LOBBY_COUNTDOWN':
-                    showScreen('lobby');
-                    const count = 3 - Math.floor((Date.now() - state.startTime) / 1000);
-                    document.getElementById('lobby-status').innerText = `遊戲即將開始... ${Math.max(0, count)}`;
-                    if (isHost && count < 0) {
-                        update(ref(db, 'gameState'), { phase: 'ROUND_PREP', round: 1 });
-                        resetPlayersForRound();
-                    }
-                    break;
-
                 case 'ROUND_PREP':
                     statusText.innerText = "全員按住按鈕以開始\nHold Button to Start";
                     statusText.className = "text-xl text-yellow-500 font-bold animate-pulse whitespace-pre-line";
@@ -244,40 +297,17 @@
                     break;
 
                 case 'ROUND_COUNTDOWN':
-                    const prepCount = 5 - Math.floor((Date.now() - state.startTime) / 1000);
-                    statusText.innerText = `準備倒數 (鬆手 = 放棄本局)\n${Math.max(0, prepCount)}`;
+                    // 初始文字，之後會被 Loop 覆蓋
                     statusText.className = "text-2xl text-red-500 font-bold whitespace-pre-line";
                     mainBtn.classList.remove('bg-blue-600');
                     mainBtn.classList.add('bg-red-600');
                     mainBtn.innerText = "保持按住...";
-                    
-                    if (isHost && prepCount < 0) {
-                        update(ref(db, 'gameState'), { 
-                            phase: 'BIDDING', 
-                            biddingStartTime: Date.now() 
-                        });
-                    }
                     break;
 
                 case 'BIDDING':
                     statusText.innerText = "競價中！鬆手出價";
                     statusText.className = "text-xl text-green-400 font-bold animate-pulse";
                     mainBtn.innerText = "放手出價 (RELEASE)";
-                    break;
-
-                case 'ROUND_RESULT':
-                    showScreen('result');
-                    if (isHost) {
-                        const resultTime = 5 - Math.floor((Date.now() - state.startTime) / 1000);
-                        if (resultTime < 0) {
-                            if (state.round >= TOTAL_ROUNDS) {
-                                update(ref(db, 'gameState'), { phase: 'GAME_OVER' });
-                            } else {
-                                update(ref(db, 'gameState'), { phase: 'ROUND_PREP', round: state.round + 1 });
-                                resetPlayersForRound();
-                            }
-                        }
-                    }
                     break;
             }
         }
@@ -289,57 +319,53 @@
 
         const startHold = (e) => {
             e.preventDefault(); 
-            onValue(ref(db, 'gameState'), (snap) => {
-                const state = snap.val();
-                if (!state) return;
-                if (state.phase === 'ROUND_PREP') {
-                    update(ref(db, `players/${myId}`), { isHolding: true });
-                }
-            }, { onlyOnce: true });
+            if (!currentGameState) return;
+            const state = currentGameState;
+            
+            if (state.phase === 'ROUND_PREP') {
+                update(ref(db, `players/${myId}`), { isHolding: true });
+            }
         };
 
         const endHold = (e) => {
             e.preventDefault();
+            if (!currentGameState) return;
+            const state = currentGameState;
             
-            onValue(ref(db, 'gameState'), (snap) => {
-                const state = snap.val();
-                if (!state) return;
-                
-                if (state.phase === 'ROUND_PREP') {
-                    update(ref(db, `players/${myId}`), { isHolding: false });
-                }
-                else if (state.phase === 'ROUND_COUNTDOWN') {
+            if (state.phase === 'ROUND_PREP') {
+                update(ref(db, `players/${myId}`), { isHolding: false });
+            }
+            else if (state.phase === 'ROUND_COUNTDOWN') {
+                update(ref(db, `players/${myId}`), { 
+                    isHolding: false,
+                    hasLockedBid: true,
+                    currentBid: 0 
+                });
+                stopLocalTimer();
+            }
+            else if (state.phase === 'BIDDING') {
+                const finalBid = parseFloat(document.getElementById('bid-timer').innerText);
+                onValue(ref(db, `players/${myId}`), (pSnap) => {
+                    const pData = pSnap.val();
+                    if (!pData || pData.hasLockedBid) return;
+
+                    let validBid = finalBid;
+                    let newRemaining = pData.remainingTime - finalBid;
+
+                    if (newRemaining < 0) {
+                        validBid = pData.remainingTime;
+                        newRemaining = 0;
+                    }
+
                     update(ref(db, `players/${myId}`), { 
                         isHolding: false,
                         hasLockedBid: true,
-                        currentBid: 0 
+                        currentBid: validBid,
+                        remainingTime: newRemaining
                     });
                     stopLocalTimer();
-                }
-                else if (state.phase === 'BIDDING') {
-                    const finalBid = parseFloat(document.getElementById('bid-timer').innerText);
-                    onValue(ref(db, `players/${myId}`), (pSnap) => {
-                        const pData = pSnap.val();
-                        if (!pData || pData.hasLockedBid) return;
-
-                        let validBid = finalBid;
-                        let newRemaining = pData.remainingTime - finalBid;
-
-                        if (newRemaining < 0) {
-                            validBid = pData.remainingTime;
-                            newRemaining = 0;
-                        }
-
-                        update(ref(db, `players/${myId}`), { 
-                            isHolding: false,
-                            hasLockedBid: true,
-                            currentBid: validBid,
-                            remainingTime: newRemaining
-                        });
-                        stopLocalTimer();
-                    }, { onlyOnce: true });
-                }
-            }, { onlyOnce: true });
+                }, { onlyOnce: true });
+            }
         };
 
         if (mainBtn) {
@@ -384,7 +410,6 @@
         // 6. Host 邏輯
         // ==========================================
         
-        // Host 按鈕更新邏輯
         function updateHostStartButton(playerList) {
             const btn = document.getElementById('btn-host-start');
             if (!btn) return;
@@ -413,42 +438,35 @@
             if (!isHost) return;
             const allReady = playerList.length >= 2 && playerList.every(p => p.isReady);
             
-            onValue(ref(db, 'gameState'), (snap) => {
-                const state = snap.val();
-                if (!state) return;
-                // 如果在倒數中，但有人取消準備了 -> 回到 LOBBY
-                if (state.phase === 'LOBBY_COUNTDOWN' && !allReady) {
-                    update(ref(db, 'gameState'), { phase: 'LOBBY' });
-                }
-            }, { onlyOnce: true });
+            if (currentGameState && currentGameState.phase === 'LOBBY_COUNTDOWN' && !allReady) {
+                update(ref(db, 'gameState'), { phase: 'LOBBY' });
+            }
         }
 
         function checkRoundLogic(playerList) {
             if (!isHost) return;
+            // 使用 currentGameState 避免依賴 onValue 快照
+            if (!currentGameState) return;
+            const state = currentGameState;
             
-            onValue(ref(db, 'gameState'), (snap) => {
-                const state = snap.val();
-                if (!state) return;
-                
-                if (state.phase === 'ROUND_PREP') {
-                    const activePlayers = playerList.filter(p => p.remainingTime > 0);
-                    const allHolding = activePlayers.length > 0 && activePlayers.every(p => p.isHolding);
-                    if (allHolding) {
-                        update(ref(db, 'gameState'), { 
-                            phase: 'ROUND_COUNTDOWN',
-                            startTime: Date.now()
-                        });
-                    }
+            if (state.phase === 'ROUND_PREP') {
+                const activePlayers = playerList.filter(p => p.remainingTime > 0);
+                const allHolding = activePlayers.length > 0 && activePlayers.every(p => p.isHolding);
+                if (allHolding) {
+                    update(ref(db, 'gameState'), { 
+                        phase: 'ROUND_COUNTDOWN',
+                        startTime: Date.now()
+                    });
                 }
-                
-                if (state.phase === 'BIDDING') {
-                     const activePlayers = playerList.filter(p => p.remainingTime > 0);
-                     const allFinished = activePlayers.every(p => p.hasLockedBid);
-                     if (allFinished) {
-                         determineWinner(activePlayers);
-                     }
-                }
-            }, { onlyOnce: true });
+            }
+            
+            if (state.phase === 'BIDDING') {
+                 const activePlayers = playerList.filter(p => p.remainingTime > 0);
+                 const allFinished = activePlayers.every(p => p.hasLockedBid);
+                 if (allFinished) {
+                     determineWinner(activePlayers);
+                 }
+            }
         }
 
         function determineWinner(players) {
@@ -533,38 +551,33 @@
             }
 
             const resultContainer = document.getElementById('result-list');
-            onValue(ref(db, 'gameState'), (snap) => {
-                const state = snap.val();
-                if (!state || !resultContainer) return;
-                
-                if (state.phase === 'ROUND_RESULT' || state.phase === 'GAME_OVER') {
-                     const winnerId = state.lastWinnerId;
-                     const winnerBid = state.lastWinnerBid;
-                     const sortedByScore = [...list].sort((a, b) => (b.score || 0) - (a.score || 0));
+            if (currentGameState && (currentGameState.phase === 'ROUND_RESULT' || currentGameState.phase === 'GAME_OVER') && resultContainer) {
+                 const winnerId = currentGameState.lastWinnerId;
+                 const winnerBid = currentGameState.lastWinnerBid;
+                 const sortedByScore = [...list].sort((a, b) => (b.score || 0) - (a.score || 0));
 
-                     const winnerText = document.getElementById('round-winner-text');
-                     if (winnerText) {
-                         if (winnerId) {
-                             const winner = list.find(p => p.id === winnerId);
-                             winnerText.innerHTML = 
-                                 `<span class="text-yellow-400 text-3xl">${winner ? winner.nickname : 'Unknown'}</span><br>Wins with ${winnerBid}s`;
-                         } else {
-                             winnerText.innerHTML = 
-                                 `<span class="text-gray-400">No Winner<br><span class="text-sm">(Tie or 0 bid)</span></span>`;
-                         }
+                 const winnerText = document.getElementById('round-winner-text');
+                 if (winnerText) {
+                     if (winnerId) {
+                         const winner = list.find(p => p.id === winnerId);
+                         winnerText.innerHTML = 
+                             `<span class="text-yellow-400 text-3xl">${winner ? winner.nickname : 'Unknown'}</span><br>Wins with ${winnerBid}s`;
+                     } else {
+                         winnerText.innerHTML = 
+                             `<span class="text-gray-400">No Winner<br><span class="text-sm">(Tie or 0 bid)</span></span>`;
                      }
-                     
-                     resultContainer.innerHTML = sortedByScore.map((p, index) => `
-                        <div class="flex justify-between items-center bg-black/30 p-2 rounded">
-                            <div class="flex items-center gap-2">
-                                <span class="text-gray-500 font-mono w-4">${index + 1}</span>
-                                <span class="${p.id === myId ? 'text-yellow-400' : 'text-white'}">${p.nickname}</span>
-                            </div>
-                            <span class="font-mono text-yellow-600">${p.score || 0} pts</span>
+                 }
+                 
+                 resultContainer.innerHTML = sortedByScore.map((p, index) => `
+                    <div class="flex justify-between items-center bg-black/30 p-2 rounded">
+                        <div class="flex items-center gap-2">
+                            <span class="text-gray-500 font-mono w-4">${index + 1}</span>
+                            <span class="${p.id === myId ? 'text-yellow-400' : 'text-white'}">${p.nickname}</span>
                         </div>
-                     `).join('');
-                }
-            }, { onlyOnce: true });
+                        <span class="font-mono text-yellow-600">${p.score || 0} pts</span>
+                    </div>
+                 `).join('');
+            }
         }
 
     </script>
