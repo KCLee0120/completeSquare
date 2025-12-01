@@ -27,6 +27,7 @@
             measurementId: "G-5KKFRQ67DN"
         };
 
+        // 初始化 Firebase
         let app, db, analytics;
         try {
             app = initializeApp(firebaseConfig);
@@ -65,8 +66,10 @@
         let currentGameState = null;
         let localBiddingStartTime = 0; 
         let cachedPlayerList = []; 
-        let myRemainingTimeCache = 0; // 緩存我的剩餘時間，用於自動鬆手檢查
+        let myRemainingTimeCache = 0; 
+        let isLocallyHolding = false; // 新增：本地按住狀態 (解決延遲問題)
         
+        // 預設值，實際會從 gameState.config 讀取
         let GAME_CONFIG = {
             totalRounds: 19,
             initialTimeMinutes: 10
@@ -144,6 +147,7 @@
 
         const handleHostStartGame = async () => {
             if (!isHost) return;
+            console.log("Host starting game...");
             
             const configSnap = await get(ref(db, 'gameState/config'));
             const config = configSnap.val() || GAME_CONFIG;
@@ -171,8 +175,9 @@
 
         const handleHostResetGame = async () => {
             if (!isHost) return;
-            if (!confirm("確定要重置遊戲並回到大廳嗎？")) return;
+            if (!confirm("確定要重置遊戲並回到大廳嗎？所有分數將被清除。")) return;
 
+            console.log("Host resetting game...");
             const configSnap = await get(ref(db, 'gameState/config'));
             const config = configSnap.val() || GAME_CONFIG;
             const startSeconds = config.initialTimeMinutes * 60;
@@ -200,6 +205,7 @@
 
         const abortGame = async (missingPlayerIds) => {
             if (!isHost) return;
+            console.log("Aborting game due to player disconnect:", missingPlayerIds);
             
             const updates = {};
             const currentRound = currentGameState.round;
@@ -294,7 +300,7 @@
                 const me = playerList.find(p => p.id === myId);
                 if (me) {
                     updateReadyButton(me.isReady);
-                    myRemainingTimeCache = me.remainingTime || 0; // 更新剩餘時間緩存
+                    myRemainingTimeCache = me.remainingTime || 0; 
                 }
 
                 renderLobbyList(playerList);
@@ -418,16 +424,13 @@
                         }
                     }
                 }
-                // 自動鬆手檢測 (Auto-Release Check)
+                // 自動鬆手檢測
                 else if (state.phase === 'BIDDING') {
-                    // 如果我正在按住，且時間已用盡
-                    // 這裡的 bidInterval 負責更新 UI，這裡負責邏輯檢測
                     if (localBiddingStartTime > 0) {
                         const delta = (now - localBiddingStartTime) / 1000;
                         const myPlayer = cachedPlayerList.find(p => p.id === myId);
                         
-                        // 確保我們拿到的是最新的 myRemainingTimeCache (從 onValue 更新)
-                        // 如果時間到了，且我還沒鎖定
+                        // 當玩家還有按住，且時間超過剩餘時間時
                         if (myPlayer && !myPlayer.hasLockedBid && delta >= myRemainingTimeCache) {
                             console.log("Time up! Auto releasing...");
                             endHold(new Event('mouseup')); // 強制觸發鬆手
@@ -538,7 +541,10 @@
                     mainBtn.innerText = "放手出價 (RELEASE)";
                     if (state.biddingStartTime) {
                         localBiddingStartTime = state.biddingStartTime;
-                        startLocalTimer(state.biddingStartTime);
+                        // 優化：只在尚未啟動時啟動，避免重複
+                        if (!bidInterval) {
+                            startLocalTimer(state.biddingStartTime);
+                        }
                     }
                     break;
             }
@@ -553,6 +559,10 @@
             if (e.cancelable) e.preventDefault();
             if (!currentGameState) return;
             const state = currentGameState;
+            
+            // 記錄本地狀態
+            isLocallyHolding = true;
+
             if (state.phase === 'ROUND_PREP') {
                 update(ref(db, `players/${myId}`), { isHolding: true });
             }
@@ -563,6 +573,9 @@
             if (!currentGameState) return;
             const state = currentGameState;
             
+            // 記錄本地狀態：立即鬆手
+            isLocallyHolding = false;
+
             if (state.phase === 'ROUND_PREP') {
                 update(ref(db, `players/${myId}`), { isHolding: false });
             }
@@ -580,7 +593,6 @@
                 let finalBid = (now - bidStart) / 1000;
                 finalBid = Math.max(0, finalBid); 
                 
-                // 檢查是否超過剩餘時間，超過則強制為剩餘時間
                 if (finalBid > myRemainingTimeCache) {
                     finalBid = myRemainingTimeCache;
                 }
@@ -603,6 +615,8 @@
                         currentBid: validBid,
                         remainingTime: newRemaining
                     });
+                    
+                    // 注意：這裡不呼叫 stopLocalTimer()，確保計時器繼續跑
                 }, { onlyOnce: true });
             }
         };
@@ -618,14 +632,23 @@
         function startLocalTimer(startTime) {
             if (bidInterval) clearInterval(bidInterval);
             const timerEl = document.getElementById('bid-timer');
+            
             bidInterval = setInterval(() => {
                 const now = getServerTime(); 
                 const delta = (now - startTime) / 1000;
-                // 更新 UI，但不要超過我的剩餘時間
                 let displayTime = Math.max(0, delta);
-                if (displayTime > myRemainingTimeCache) {
-                    displayTime = myRemainingTimeCache;
+                
+                const me = cachedPlayerList.find(p => p.id === myId);
+                
+                // 修正：結合 isLocallyHolding 解決網路延遲導致的計時器卡頓
+                // 只有當「資料庫說我有按住」且「我本地也真的按住」時，才執行鎖定邏輯
+                // 一旦我本地鬆手 (isLocallyHolding=false)，計時器立刻解鎖，顯示全域時間
+                if (me && me.isHolding && isLocallyHolding && !me.hasLockedBid) {
+                    if (displayTime > myRemainingTimeCache) {
+                        displayTime = myRemainingTimeCache;
+                    }
                 }
+                
                 if (timerEl) timerEl.innerText = displayTime.toFixed(1);
             }, 50);
         }
@@ -640,7 +663,10 @@
                 const state = snap.val();
                 if (state && state.phase === 'BIDDING') {
                     localBiddingStartTime = state.biddingStartTime;
-                    startLocalTimer(state.biddingStartTime);
+                    // 防止重複啟動
+                    if (!bidInterval) {
+                        startLocalTimer(state.biddingStartTime);
+                    }
                 }
             });
         }
@@ -684,11 +710,10 @@
             if (!currentGameState) return;
             const state = currentGameState;
             
-            // 準備階段：全員按住 (不管時間剩多少) -> 倒數
             if (state.phase === 'ROUND_PREP') {
+                const activePlayers = playerList.filter(p => p.remainingTime > 0);
                 // 修正：包含所有玩家，不論時間
-                const activePlayers = playerList; 
-                const allHolding = activePlayers.length > 0 && activePlayers.every(p => p.isHolding);
+                const allHolding = playerList.length > 0 && playerList.every(p => p.isHolding);
                 if (allHolding) {
                     update(ref(db, 'gameState'), { 
                         phase: 'ROUND_COUNTDOWN',
@@ -698,22 +723,16 @@
             }
             
             if (state.phase === 'BIDDING') {
-                 // 篩選出有剩餘時間的玩家
                  const activePlayers = playerList.filter(p => p.remainingTime > 0);
                  
-                 // 判定條件 1: 所有"有時間"的玩家都已鎖定出價
                  const allFinished = activePlayers.every(p => p.hasLockedBid);
-                 
-                 // 判定條件 2: 所有"有時間"的玩家都已鬆手 (全員放棄)
-                 // 這能解決「雖然沒鎖定 (hasLockedBid=false)，但沒人按住」的僵局
+                 // 判定全員放棄：有時間的人都沒按住
                  const nobodyIsHolding = activePlayers.every(p => !p.isHolding);
-
-                 // 如果全員完成 OR (全員鬆手 AND 遊戲已進行了一點時間)
-                 // 加一點延遲判定 (e.g. 500ms) 防止剛開始的一瞬間誤判
                  const timeSinceStart = Date.now() - (state.biddingStartTime || 0);
 
+                 // 延遲一點時間再判定全員放棄，避免剛開始的誤判
                  if (allFinished || (nobodyIsHolding && timeSinceStart > 1000)) {
-                     determineWinner(playerList); // 傳入所有玩家進行結算
+                     determineWinner(playerList); 
                  }
             }
         }
@@ -929,8 +948,8 @@
         
         <div id="lobby-status" class="text-center text-yellow-500 text-lg mb-4 font-mono h-8 shrink-0">WAITING FOR PLAYERS...</div>
         
+        <!-- List -->
         <div id="lobby-player-list" class="space-y-2 mb-6 w-full">
-            <!-- List -->
         </div>
 
         <div class="mt-auto w-full space-y-4 shrink-0 pb-6">
