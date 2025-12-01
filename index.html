@@ -27,7 +27,6 @@
             measurementId: "G-5KKFRQ67DN"
         };
 
-        // 初始化 Firebase
         let app, db, analytics;
         try {
             app = initializeApp(firebaseConfig);
@@ -40,11 +39,9 @@
         }
 
         // ==========================================
-        // 2. 時間同步校準 (關鍵修正)
+        // 2. 時間同步校準
         // ==========================================
         let serverTimeOffset = 0;
-        
-        // 取得校準後的伺服器時間 (替代 Date.now())
         const getServerTime = () => {
             return Date.now() + serverTimeOffset;
         };
@@ -53,7 +50,6 @@
             const offsetRef = ref(db, ".info/serverTimeOffset");
             onValue(offsetRef, (snap) => {
                 serverTimeOffset = snap.val();
-                console.log("Time Offset Calibrated:", serverTimeOffset);
             });
         }
 
@@ -69,8 +65,8 @@
         let currentGameState = null;
         let localBiddingStartTime = 0; 
         let cachedPlayerList = []; 
+        let myRemainingTimeCache = 0; // 緩存我的剩餘時間，用於自動鬆手檢查
         
-        // 預設值，實際會從 gameState.config 讀取
         let GAME_CONFIG = {
             totalRounds: 19,
             initialTimeMinutes: 10
@@ -148,7 +144,6 @@
 
         const handleHostStartGame = async () => {
             if (!isHost) return;
-            console.log("Host starting game...");
             
             const configSnap = await get(ref(db, 'gameState/config'));
             const config = configSnap.val() || GAME_CONFIG;
@@ -176,9 +171,8 @@
 
         const handleHostResetGame = async () => {
             if (!isHost) return;
-            if (!confirm("確定要重置遊戲並回到大廳嗎？所有分數將被清除。")) return;
+            if (!confirm("確定要重置遊戲並回到大廳嗎？")) return;
 
-            console.log("Host resetting game...");
             const configSnap = await get(ref(db, 'gameState/config'));
             const config = configSnap.val() || GAME_CONFIG;
             const startSeconds = config.initialTimeMinutes * 60;
@@ -206,7 +200,6 @@
 
         const abortGame = async (missingPlayerIds) => {
             if (!isHost) return;
-            console.log("Aborting game due to player disconnect:", missingPlayerIds);
             
             const updates = {};
             const currentRound = currentGameState.round;
@@ -299,7 +292,10 @@
                 }
 
                 const me = playerList.find(p => p.id === myId);
-                if (me) updateReadyButton(me.isReady);
+                if (me) {
+                    updateReadyButton(me.isReady);
+                    myRemainingTimeCache = me.remainingTime || 0; // 更新剩餘時間緩存
+                }
 
                 renderLobbyList(playerList);
                 updateHostStartButton(playerList);
@@ -333,6 +329,7 @@
                 }
 
                 handleStateChange(state);
+                renderScoreboard(cachedPlayerList);
             });
         }
         
@@ -374,13 +371,13 @@
         }
 
         // ==========================================
-        // 6. Game Loop (使用 getServerTime)
+        // 6. Game Loop (核心計時與強制結束)
         // ==========================================
         setInterval(() => {
             try {
                 if (!currentGameState || !currentGameState.phase) return;
                 
-                const now = getServerTime(); // 關鍵：使用校準時間
+                const now = getServerTime();
                 const state = currentGameState;
                 const startTime = state.startTime || state.biddingStartTime || now;
 
@@ -402,7 +399,7 @@
                     if (el) el.innerText = `準備倒數 (鬆手 = 放棄本局)\n${Math.max(0, Math.ceil(count))}`;
                     
                     if (isHost && count <= 0) {
-                        update(ref(db, 'gameState'), { phase: 'BIDDING', biddingStartTime: getServerTime() }); // 這裡寫入當前校準時間
+                        update(ref(db, 'gameState'), { phase: 'BIDDING', biddingStartTime: getServerTime() });
                     }
                 }
                 else if (state.phase === 'ROUND_RESULT') {
@@ -418,6 +415,22 @@
                         } else {
                             update(ref(db, 'gameState'), { phase: 'ROUND_PREP', round: state.round + 1 });
                             resetPlayersForRound();
+                        }
+                    }
+                }
+                // 自動鬆手檢測 (Auto-Release Check)
+                else if (state.phase === 'BIDDING') {
+                    // 如果我正在按住，且時間已用盡
+                    // 這裡的 bidInterval 負責更新 UI，這裡負責邏輯檢測
+                    if (localBiddingStartTime > 0) {
+                        const delta = (now - localBiddingStartTime) / 1000;
+                        const myPlayer = cachedPlayerList.find(p => p.id === myId);
+                        
+                        // 確保我們拿到的是最新的 myRemainingTimeCache (從 onValue 更新)
+                        // 如果時間到了，且我還沒鎖定
+                        if (myPlayer && !myPlayer.hasLockedBid && delta >= myRemainingTimeCache) {
+                            console.log("Time up! Auto releasing...");
+                            endHold(new Event('mouseup')); // 強制觸發鬆手
                         }
                     }
                 }
@@ -475,7 +488,7 @@
                 stopLocalTimer();
                 if (localBiddingStartTime > 0) {
                     const finalTime = (state.startTime - localBiddingStartTime) / 1000;
-                    document.getElementById('bid-timer').innerText = Math.max(0, finalTime).toFixed(1); // 防負數
+                    document.getElementById('bid-timer').innerText = Math.max(0, finalTime).toFixed(1);
                 }
 
                 hideAll();
@@ -537,7 +550,7 @@
         const mainBtn = document.getElementById('main-btn');
 
         const startHold = (e) => {
-            e.preventDefault(); 
+            if (e.cancelable) e.preventDefault();
             if (!currentGameState) return;
             const state = currentGameState;
             if (state.phase === 'ROUND_PREP') {
@@ -546,7 +559,7 @@
         };
 
         const endHold = (e) => {
-            e.preventDefault();
+            if (e && e.cancelable) e.preventDefault();
             if (!currentGameState) return;
             const state = currentGameState;
             
@@ -563,9 +576,14 @@
             }
             else if (state.phase === 'BIDDING') {
                 const bidStart = state.biddingStartTime || localBiddingStartTime;
-                const now = getServerTime(); // 使用校準時間
+                const now = getServerTime(); 
                 let finalBid = (now - bidStart) / 1000;
-                finalBid = Math.max(0, finalBid); // 確保不為負
+                finalBid = Math.max(0, finalBid); 
+                
+                // 檢查是否超過剩餘時間，超過則強制為剩餘時間
+                if (finalBid > myRemainingTimeCache) {
+                    finalBid = myRemainingTimeCache;
+                }
                 
                 onValue(ref(db, `players/${myId}`), (pSnap) => {
                     const pData = pSnap.val();
@@ -601,9 +619,14 @@
             if (bidInterval) clearInterval(bidInterval);
             const timerEl = document.getElementById('bid-timer');
             bidInterval = setInterval(() => {
-                const now = getServerTime(); // 使用校準時間
+                const now = getServerTime(); 
                 const delta = (now - startTime) / 1000;
-                if (timerEl) timerEl.innerText = Math.max(0, delta).toFixed(1); // 確保顯示不為負
+                // 更新 UI，但不要超過我的剩餘時間
+                let displayTime = Math.max(0, delta);
+                if (displayTime > myRemainingTimeCache) {
+                    displayTime = myRemainingTimeCache;
+                }
+                if (timerEl) timerEl.innerText = displayTime.toFixed(1);
             }, 50);
         }
 
@@ -661,22 +684,36 @@
             if (!currentGameState) return;
             const state = currentGameState;
             
+            // 準備階段：全員按住 (不管時間剩多少) -> 倒數
             if (state.phase === 'ROUND_PREP') {
-                const activePlayers = playerList.filter(p => p.remainingTime > 0);
+                // 修正：包含所有玩家，不論時間
+                const activePlayers = playerList; 
                 const allHolding = activePlayers.length > 0 && activePlayers.every(p => p.isHolding);
                 if (allHolding) {
                     update(ref(db, 'gameState'), { 
                         phase: 'ROUND_COUNTDOWN',
-                        startTime: getServerTime() // 寫入校準後的時間
+                        startTime: getServerTime() 
                     });
                 }
             }
             
             if (state.phase === 'BIDDING') {
+                 // 篩選出有剩餘時間的玩家
                  const activePlayers = playerList.filter(p => p.remainingTime > 0);
+                 
+                 // 判定條件 1: 所有"有時間"的玩家都已鎖定出價
                  const allFinished = activePlayers.every(p => p.hasLockedBid);
-                 if (allFinished && activePlayers.length > 0) {
-                     determineWinner(activePlayers);
+                 
+                 // 判定條件 2: 所有"有時間"的玩家都已鬆手 (全員放棄)
+                 // 這能解決「雖然沒鎖定 (hasLockedBid=false)，但沒人按住」的僵局
+                 const nobodyIsHolding = activePlayers.every(p => !p.isHolding);
+
+                 // 如果全員完成 OR (全員鬆手 AND 遊戲已進行了一點時間)
+                 // 加一點延遲判定 (e.g. 500ms) 防止剛開始的一瞬間誤判
+                 const timeSinceStart = Date.now() - (state.biddingStartTime || 0);
+
+                 if (allFinished || (nobodyIsHolding && timeSinceStart > 1000)) {
+                     determineWinner(playerList); // 傳入所有玩家進行結算
                  }
             }
         }
@@ -697,7 +734,7 @@
             
             const updates = {};
             const round = currentGameState.round;
-            const startTime = getServerTime(); // 使用校準時間
+            const startTime = getServerTime(); 
 
             players.forEach(p => {
                 updates[`players/${p.id}/bidHistory/${round}`] = p.currentBid || 0;
@@ -861,7 +898,7 @@
         <p class="text-gray-600 text-xs mt-8">DEVIL'S PLAN SEASON 2 FAN MADE</p>
     </div>
 
-    <!-- Lobby (修正版：整體可捲動，確保底部按鈕可見) -->
+    <!-- Lobby -->
     <div id="screen-lobby" class="hidden flex flex-col h-full p-6 overflow-y-auto">
         <div class="flex justify-between items-center mb-6 shrink-0">
             <button id="btn-leave" class="text-xs text-red-500 border border-red-900 px-3 py-1 rounded hover:bg-red-900/30 transition-colors">
@@ -892,12 +929,10 @@
         
         <div id="lobby-status" class="text-center text-yellow-500 text-lg mb-4 font-mono h-8 shrink-0">WAITING FOR PLAYERS...</div>
         
-        <!-- 玩家列表 (自然延伸，不強制 flex-1) -->
         <div id="lobby-player-list" class="space-y-2 mb-6 w-full">
             <!-- List -->
         </div>
 
-        <!-- 底部按鈕區 (使用 margin-top auto 推到底部，但如果內容多則隨內容延伸) -->
         <div class="mt-auto w-full space-y-4 shrink-0 pb-6">
             <button id="btn-host-start" class="hidden w-full bg-yellow-600 border border-yellow-400 text-white py-4 rounded font-bold tracking-widest uppercase hover:bg-yellow-700 transition-all shadow-lg shadow-yellow-900/50">
                 START GAME
