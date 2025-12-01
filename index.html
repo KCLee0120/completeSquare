@@ -40,7 +40,25 @@
         }
 
         // ==========================================
-        // 2. 全域變數與狀態
+        // 2. 時間同步校準 (關鍵修正)
+        // ==========================================
+        let serverTimeOffset = 0;
+        
+        // 取得校準後的伺服器時間 (替代 Date.now())
+        const getServerTime = () => {
+            return Date.now() + serverTimeOffset;
+        };
+
+        if (db) {
+            const offsetRef = ref(db, ".info/serverTimeOffset");
+            onValue(offsetRef, (snap) => {
+                serverTimeOffset = snap.val();
+                console.log("Time Offset Calibrated:", serverTimeOffset);
+            });
+        }
+
+        // ==========================================
+        // 3. 全域變數與狀態
         // ==========================================
         let myId = localStorage.getItem('dp_player_id') || 'player_' + Math.random().toString(36).substr(2, 9);
         localStorage.setItem('dp_player_id', myId);
@@ -67,11 +85,11 @@
             get lobby() { return document.getElementById('screen-lobby'); },
             get game() { return document.getElementById('screen-game'); },
             get result() { return document.getElementById('screen-result'); },
-            get aborted() { return document.getElementById('screen-aborted'); } // 新增 Aborted 畫面
+            get aborted() { return document.getElementById('screen-aborted'); }
         };
 
         // ==========================================
-        // 3. 遊戲邏輯
+        // 4. 遊戲邏輯
         // ==========================================
 
         window.joinGame = () => {
@@ -137,8 +155,6 @@
             const startSeconds = config.initialTimeMinutes * 60;
 
             const updates = {};
-            
-            // 記錄當前所有玩家 ID，用於中斷檢測
             const activePlayerIds = cachedPlayerList.map(p => p.id);
             updates['gameState/activePlayers'] = activePlayerIds;
 
@@ -183,12 +199,11 @@
             updates['gameState/round'] = 1;
             updates['gameState/lastWinnerId'] = null;
             updates['gameState/lastWinnerBid'] = null;
-            updates['gameState/activePlayers'] = null; // 清除活躍名單
+            updates['gameState/activePlayers'] = null; 
 
             await update(ref(db), updates);
         };
 
-        // 新增：遊戲中斷處理 (Abort)
         const abortGame = async (missingPlayerIds) => {
             if (!isHost) return;
             console.log("Aborting game due to player disconnect:", missingPlayerIds);
@@ -196,12 +211,9 @@
             const updates = {};
             const currentRound = currentGameState.round;
 
-            // 1. 設定為中斷狀態
             updates['gameState/phase'] = 'GAME_ABORTED';
             updates['gameState/abortTime'] = serverTimestamp();
             
-            // 2. 清除該回合數據 (依據需求)
-            // 由於可能已經有人寫入出價，我們需要遍歷所有玩家清除當前回合的 bidHistory
             cachedPlayerList.forEach(p => {
                 updates[`players/${p.id}/bidHistory/${currentRound}`] = null;
                 updates[`players/${p.id}/currentBid`] = 0;
@@ -211,9 +223,7 @@
 
             await update(ref(db), updates);
 
-            // 3秒後自動回到 Lobby (可選)
             setTimeout(() => {
-                // 檢查狀態確保沒有被其他操作覆蓋
                 if (currentGameState && currentGameState.phase === 'GAME_ABORTED') {
                     handleHostResetGame();
                 }
@@ -260,7 +270,7 @@
         }
 
         // ==========================================
-        // 4. Firebase 監聽 & 連線檢測
+        // 5. Firebase 監聽 & 連線檢測
         // ==========================================
 
         if(db) {
@@ -293,10 +303,8 @@
 
                 renderLobbyList(playerList);
                 updateHostStartButton(playerList);
-                
-                // 執行檢查
                 checkLobbyAbort(playerList);
-                checkActivePlayersConnection(playerList); // 新增：檢查斷線
+                checkActivePlayersConnection(playerList); 
                 checkRoundLogic(playerList); 
                 renderScoreboard(playerList);
             });
@@ -348,19 +356,15 @@
             if (document.activeElement !== roundInput) roundInput.value = config.totalRounds;
         }
 
-        // 新增：檢查是否有玩家在遊戲中斷線
         function checkActivePlayersConnection(currentPlayers) {
             if (!isHost || !currentGameState) return;
             
-            // 只在遊戲進行中檢查
             const phase = currentGameState.phase;
             const isGameRunning = phase === 'ROUND_PREP' || phase === 'ROUND_COUNTDOWN' || phase === 'BIDDING' || phase === 'ROUND_RESULT';
             
             if (isGameRunning && currentGameState.activePlayers) {
-                const activeIds = currentGameState.activePlayers; // 遊戲開始時的名單
+                const activeIds = currentGameState.activePlayers; 
                 const currentIds = currentPlayers.map(p => p.id);
-                
-                // 檢查是否所有 activeIds 都在 currentIds 中
                 const missingIds = activeIds.filter(id => !currentIds.includes(id));
                 
                 if (missingIds.length > 0) {
@@ -370,13 +374,13 @@
         }
 
         // ==========================================
-        // 5. Game Loop
+        // 6. Game Loop (使用 getServerTime)
         // ==========================================
         setInterval(() => {
             try {
                 if (!currentGameState || !currentGameState.phase) return;
                 
-                const now = Date.now();
+                const now = getServerTime(); // 關鍵：使用校準時間
                 const state = currentGameState;
                 const startTime = state.startTime || state.biddingStartTime || now;
 
@@ -398,7 +402,7 @@
                     if (el) el.innerText = `準備倒數 (鬆手 = 放棄本局)\n${Math.max(0, Math.ceil(count))}`;
                     
                     if (isHost && count <= 0) {
-                        update(ref(db, 'gameState'), { phase: 'BIDDING', biddingStartTime: Date.now() });
+                        update(ref(db, 'gameState'), { phase: 'BIDDING', biddingStartTime: getServerTime() }); // 這裡寫入當前校準時間
                     }
                 }
                 else if (state.phase === 'ROUND_RESULT') {
@@ -425,7 +429,6 @@
         function handleStateChange(state) {
             if (!state || !state.phase) return;
 
-            // 隱藏所有畫面
             const login = document.getElementById('screen-login');
             const lobby = document.getElementById('screen-lobby');
             const game = document.getElementById('screen-game');
@@ -440,7 +443,6 @@
                 if(aborted) aborted.classList.add('hidden');
             };
 
-            // 畫面切換邏輯
             if (state.phase === 'LOBBY' || state.phase === 'LOBBY_COUNTDOWN') {
                 hideAll();
                 if(lobby) lobby.classList.remove('hidden');
@@ -465,7 +467,6 @@
                 renderScoreboard(cachedPlayerList);
 
             } else if (state.phase === 'GAME_ABORTED') {
-                // 新增：處理中斷狀態
                 hideAll();
                 if(aborted) aborted.classList.remove('hidden');
 
@@ -474,10 +475,9 @@
                 stopLocalTimer();
                 if (localBiddingStartTime > 0) {
                     const finalTime = (state.startTime - localBiddingStartTime) / 1000;
-                    document.getElementById('bid-timer').innerText = finalTime.toFixed(1);
+                    document.getElementById('bid-timer').innerText = Math.max(0, finalTime).toFixed(1); // 防負數
                 }
 
-                // 延遲切換邏輯
                 hideAll();
                 if(game) game.classList.remove('hidden'); 
                 
@@ -532,7 +532,7 @@
         }
 
         // ==========================================
-        // 6. 按鈕互動 & 計時器
+        // 7. 按鈕互動 & 計時器
         // ==========================================
         const mainBtn = document.getElementById('main-btn');
 
@@ -563,7 +563,9 @@
             }
             else if (state.phase === 'BIDDING') {
                 const bidStart = state.biddingStartTime || localBiddingStartTime;
-                const finalBid = (Date.now() - bidStart) / 1000;
+                const now = getServerTime(); // 使用校準時間
+                let finalBid = (now - bidStart) / 1000;
+                finalBid = Math.max(0, finalBid); // 確保不為負
                 
                 onValue(ref(db, `players/${myId}`), (pSnap) => {
                     const pData = pSnap.val();
@@ -599,9 +601,9 @@
             if (bidInterval) clearInterval(bidInterval);
             const timerEl = document.getElementById('bid-timer');
             bidInterval = setInterval(() => {
-                const now = Date.now();
+                const now = getServerTime(); // 使用校準時間
                 const delta = (now - startTime) / 1000;
-                if (timerEl) timerEl.innerText = delta.toFixed(1);
+                if (timerEl) timerEl.innerText = Math.max(0, delta).toFixed(1); // 確保顯示不為負
             }, 50);
         }
 
@@ -621,7 +623,7 @@
         }
 
         // ==========================================
-        // 7. Host 輔助邏輯
+        // 8. Host 輔助邏輯
         // ==========================================
         
         function updateHostStartButton(playerList) {
@@ -665,7 +667,7 @@
                 if (allHolding) {
                     update(ref(db, 'gameState'), { 
                         phase: 'ROUND_COUNTDOWN',
-                        startTime: Date.now()
+                        startTime: getServerTime() // 寫入校準後的時間
                     });
                 }
             }
@@ -695,7 +697,7 @@
             
             const updates = {};
             const round = currentGameState.round;
-            const startTime = Date.now();
+            const startTime = getServerTime(); // 使用校準時間
 
             players.forEach(p => {
                 updates[`players/${p.id}/bidHistory/${round}`] = p.currentBid || 0;
@@ -728,7 +730,7 @@
         }
 
         // ==========================================
-        // 8. 渲染 UI
+        // 9. 渲染 UI
         // ==========================================
         
         function renderLobbyList(list) {
