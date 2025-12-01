@@ -66,7 +66,8 @@
             get login() { return document.getElementById('screen-login'); },
             get lobby() { return document.getElementById('screen-lobby'); },
             get game() { return document.getElementById('screen-game'); },
-            get result() { return document.getElementById('screen-result'); }
+            get result() { return document.getElementById('screen-result'); },
+            get aborted() { return document.getElementById('screen-aborted'); } // 新增 Aborted 畫面
         };
 
         // ==========================================
@@ -136,6 +137,11 @@
             const startSeconds = config.initialTimeMinutes * 60;
 
             const updates = {};
+            
+            // 記錄當前所有玩家 ID，用於中斷檢測
+            const activePlayerIds = cachedPlayerList.map(p => p.id);
+            updates['gameState/activePlayers'] = activePlayerIds;
+
             cachedPlayerList.forEach(p => {
                 updates[`players/${p.id}/remainingTime`] = startSeconds;
                 updates[`players/${p.id}/score`] = 0;
@@ -152,7 +158,6 @@
             await update(ref(db), updates);
         };
 
-        // Host 重置遊戲 (Play Again)
         const handleHostResetGame = async () => {
             if (!isHost) return;
             if (!confirm("確定要重置遊戲並回到大廳嗎？所有分數將被清除。")) return;
@@ -164,7 +169,6 @@
 
             const updates = {};
             
-            // 重置所有玩家狀態
             cachedPlayerList.forEach(p => {
                 updates[`players/${p.id}/remainingTime`] = startSeconds;
                 updates[`players/${p.id}/score`] = 0;
@@ -172,16 +176,48 @@
                 updates[`players/${p.id}/isHolding`] = false;
                 updates[`players/${p.id}/hasLockedBid`] = false;
                 updates[`players/${p.id}/bidHistory`] = null; 
-                updates[`players/${p.id}/isReady`] = false; // 取消準備狀態
+                updates[`players/${p.id}/isReady`] = false; 
             });
 
-            // 重置遊戲狀態回 LOBBY
             updates['gameState/phase'] = 'LOBBY';
             updates['gameState/round'] = 1;
             updates['gameState/lastWinnerId'] = null;
             updates['gameState/lastWinnerBid'] = null;
+            updates['gameState/activePlayers'] = null; // 清除活躍名單
 
             await update(ref(db), updates);
+        };
+
+        // 新增：遊戲中斷處理 (Abort)
+        const abortGame = async (missingPlayerIds) => {
+            if (!isHost) return;
+            console.log("Aborting game due to player disconnect:", missingPlayerIds);
+            
+            const updates = {};
+            const currentRound = currentGameState.round;
+
+            // 1. 設定為中斷狀態
+            updates['gameState/phase'] = 'GAME_ABORTED';
+            updates['gameState/abortTime'] = serverTimestamp();
+            
+            // 2. 清除該回合數據 (依據需求)
+            // 由於可能已經有人寫入出價，我們需要遍歷所有玩家清除當前回合的 bidHistory
+            cachedPlayerList.forEach(p => {
+                updates[`players/${p.id}/bidHistory/${currentRound}`] = null;
+                updates[`players/${p.id}/currentBid`] = 0;
+                updates[`players/${p.id}/isHolding`] = false;
+                updates[`players/${p.id}/hasLockedBid`] = false;
+            });
+
+            await update(ref(db), updates);
+
+            // 3秒後自動回到 Lobby (可選)
+            setTimeout(() => {
+                // 檢查狀態確保沒有被其他操作覆蓋
+                if (currentGameState && currentGameState.phase === 'GAME_ABORTED') {
+                    handleHostResetGame();
+                }
+            }, 3000);
         };
 
         const bindEvents = () => {
@@ -224,7 +260,7 @@
         }
 
         // ==========================================
-        // 4. Firebase 監聽
+        // 4. Firebase 監聽 & 連線檢測
         // ==========================================
 
         if(db) {
@@ -257,7 +293,10 @@
 
                 renderLobbyList(playerList);
                 updateHostStartButton(playerList);
+                
+                // 執行檢查
                 checkLobbyAbort(playerList);
+                checkActivePlayersConnection(playerList); // 新增：檢查斷線
                 checkRoundLogic(playerList); 
                 renderScoreboard(playerList);
             });
@@ -307,6 +346,27 @@
             const roundInput = document.getElementById('conf-rounds');
             if (document.activeElement !== timeInput) timeInput.value = config.initialTimeMinutes;
             if (document.activeElement !== roundInput) roundInput.value = config.totalRounds;
+        }
+
+        // 新增：檢查是否有玩家在遊戲中斷線
+        function checkActivePlayersConnection(currentPlayers) {
+            if (!isHost || !currentGameState) return;
+            
+            // 只在遊戲進行中檢查
+            const phase = currentGameState.phase;
+            const isGameRunning = phase === 'ROUND_PREP' || phase === 'ROUND_COUNTDOWN' || phase === 'BIDDING' || phase === 'ROUND_RESULT';
+            
+            if (isGameRunning && currentGameState.activePlayers) {
+                const activeIds = currentGameState.activePlayers; // 遊戲開始時的名單
+                const currentIds = currentPlayers.map(p => p.id);
+                
+                // 檢查是否所有 activeIds 都在 currentIds 中
+                const missingIds = activeIds.filter(id => !currentIds.includes(id));
+                
+                if (missingIds.length > 0) {
+                    abortGame(missingIds);
+                }
+            }
         }
 
         // ==========================================
@@ -365,19 +425,36 @@
         function handleStateChange(state) {
             if (!state || !state.phase) return;
 
+            // 隱藏所有畫面
+            const login = document.getElementById('screen-login');
+            const lobby = document.getElementById('screen-lobby');
+            const game = document.getElementById('screen-game');
+            const result = document.getElementById('screen-result');
+            const aborted = document.getElementById('screen-aborted');
+            
+            const hideAll = () => {
+                if(login) login.classList.add('hidden');
+                if(lobby) lobby.classList.add('hidden');
+                if(game) game.classList.add('hidden');
+                if(result) result.classList.add('hidden');
+                if(aborted) aborted.classList.add('hidden');
+            };
+
+            // 畫面切換邏輯
             if (state.phase === 'LOBBY' || state.phase === 'LOBBY_COUNTDOWN') {
-                showScreen('lobby');
+                hideAll();
+                if(lobby) lobby.classList.remove('hidden');
                 if (state.phase === 'LOBBY') {
                     const el = document.getElementById('lobby-status');
                     if(el) el.innerText = "WAITING FOR PLAYERS...";
                 }
             } else if (state.phase === 'GAME_OVER') {
-                showScreen('result');
+                hideAll();
+                if(result) result.classList.remove('hidden');
                 document.getElementById('round-winner-text').innerHTML = "遊戲結束<br>Game Over";
                 const timerEl = document.getElementById('result-timer-text');
                 if(timerEl) timerEl.classList.add('hidden');
                 
-                // Host 顯示重置按鈕
                 const resetBtn = document.getElementById('btn-host-reset');
                 if (isHost) {
                     resetBtn.classList.remove('hidden');
@@ -387,28 +464,35 @@
                 
                 renderScoreboard(cachedPlayerList);
 
-            } else if (state.phase === 'ROUND_RESULT') {
-                // 隱藏重置按鈕
-                document.getElementById('btn-host-reset').classList.add('hidden');
+            } else if (state.phase === 'GAME_ABORTED') {
+                // 新增：處理中斷狀態
+                hideAll();
+                if(aborted) aborted.classList.remove('hidden');
 
+            } else if (state.phase === 'ROUND_RESULT') {
+                document.getElementById('btn-host-reset').classList.add('hidden');
                 stopLocalTimer();
                 if (localBiddingStartTime > 0) {
                     const finalTime = (state.startTime - localBiddingStartTime) / 1000;
                     document.getElementById('bid-timer').innerText = finalTime.toFixed(1);
                 }
 
-                showScreen('game'); 
+                // 延遲切換邏輯
+                hideAll();
+                if(game) game.classList.remove('hidden'); 
+                
                 setTimeout(() => {
                     if (currentGameState && currentGameState.phase === 'ROUND_RESULT') {
-                        showScreen('result');
+                        hideAll();
+                        if(result) result.classList.remove('hidden');
                         const timerEl = document.getElementById('result-timer-text');
                         if(timerEl) timerEl.classList.remove('hidden');
                     }
                 }, ROUND_LINGER_TIME * 1000);
 
             } else {
-                showScreen('game');
-                // 隱藏重置按鈕
+                hideAll();
+                if(game) game.classList.remove('hidden');
                 document.getElementById('btn-host-reset').classList.add('hidden');
             }
 
@@ -647,21 +731,6 @@
         // 8. 渲染 UI
         // ==========================================
         
-        function showScreen(screenName) {
-            const login = document.getElementById('screen-login');
-            const lobby = document.getElementById('screen-lobby');
-            const game = document.getElementById('screen-game');
-            const result = document.getElementById('screen-result');
-            
-            if(login) login.classList.add('hidden');
-            if(lobby) lobby.classList.add('hidden');
-            if(game) game.classList.add('hidden');
-            if(result) result.classList.add('hidden');
-            
-            const target = document.getElementById('screen-' + screenName);
-            if(target) target.classList.remove('hidden');
-        }
-
         function renderLobbyList(list) {
             const container = document.getElementById('lobby-player-list');
             if (!container) return;
@@ -908,6 +977,13 @@
             </div>
         </div>
 
+    </div>
+
+    <!-- ABORTED Screen -->
+    <div id="screen-aborted" class="hidden absolute inset-0 bg-red-900/90 z-50 flex flex-col items-center justify-center p-6 animate-fade-in text-center">
+        <h1 class="text-4xl font-bold text-white mb-4">GAME ABORTED</h1>
+        <p class="text-xl text-red-200">A player has disconnected.</p>
+        <p class="text-sm text-red-300 mt-2">Returning to Lobby...</p>
     </div>
 
 </body>
