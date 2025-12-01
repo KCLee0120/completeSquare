@@ -89,7 +89,7 @@
                 currentBid: 0,
                 isHolding: false,
                 hasLockedBid: false, 
-                bidHistory: {}, // 初始化歷史記錄
+                bidHistory: {}, 
                 joinedAt: serverTimestamp()
             });
 
@@ -142,7 +142,7 @@
                 updates[`players/${p.id}/currentBid`] = 0;
                 updates[`players/${p.id}/isHolding`] = false;
                 updates[`players/${p.id}/hasLockedBid`] = false;
-                updates[`players/${p.id}/bidHistory`] = null; // 清空歷史
+                updates[`players/${p.id}/bidHistory`] = null; 
             });
             
             updates['gameState/phase'] = 'LOBBY_COUNTDOWN';
@@ -152,12 +152,49 @@
             await update(ref(db), updates);
         };
 
+        // Host 重置遊戲 (Play Again)
+        const handleHostResetGame = async () => {
+            if (!isHost) return;
+            if (!confirm("確定要重置遊戲並回到大廳嗎？所有分數將被清除。")) return;
+
+            console.log("Host resetting game...");
+            const configSnap = await get(ref(db, 'gameState/config'));
+            const config = configSnap.val() || GAME_CONFIG;
+            const startSeconds = config.initialTimeMinutes * 60;
+
+            const updates = {};
+            
+            // 重置所有玩家狀態
+            cachedPlayerList.forEach(p => {
+                updates[`players/${p.id}/remainingTime`] = startSeconds;
+                updates[`players/${p.id}/score`] = 0;
+                updates[`players/${p.id}/currentBid`] = 0;
+                updates[`players/${p.id}/isHolding`] = false;
+                updates[`players/${p.id}/hasLockedBid`] = false;
+                updates[`players/${p.id}/bidHistory`] = null; 
+                updates[`players/${p.id}/isReady`] = false; // 取消準備狀態
+            });
+
+            // 重置遊戲狀態回 LOBBY
+            updates['gameState/phase'] = 'LOBBY';
+            updates['gameState/round'] = 1;
+            updates['gameState/lastWinnerId'] = null;
+            updates['gameState/lastWinnerBid'] = null;
+
+            await update(ref(db), updates);
+        };
+
         const bindEvents = () => {
             const leaveBtn = document.getElementById('btn-leave');
             if (leaveBtn) leaveBtn.addEventListener('click', handleLeaveGame);
+            
             const hostStartBtn = document.getElementById('btn-host-start');
             if (hostStartBtn) hostStartBtn.addEventListener('click', handleHostStartGame);
+            
+            const hostResetBtn = document.getElementById('btn-host-reset');
+            if (hostResetBtn) hostResetBtn.addEventListener('click', handleHostResetGame);
         };
+        
         if (document.readyState === 'loading') {
             document.addEventListener('DOMContentLoaded', bindEvents);
         } else {
@@ -340,9 +377,20 @@
                 const timerEl = document.getElementById('result-timer-text');
                 if(timerEl) timerEl.classList.add('hidden');
                 
+                // Host 顯示重置按鈕
+                const resetBtn = document.getElementById('btn-host-reset');
+                if (isHost) {
+                    resetBtn.classList.remove('hidden');
+                } else {
+                    resetBtn.classList.add('hidden');
+                }
+                
                 renderScoreboard(cachedPlayerList);
 
             } else if (state.phase === 'ROUND_RESULT') {
+                // 隱藏重置按鈕
+                document.getElementById('btn-host-reset').classList.add('hidden');
+
                 stopLocalTimer();
                 if (localBiddingStartTime > 0) {
                     const finalTime = (state.startTime - localBiddingStartTime) / 1000;
@@ -360,6 +408,8 @@
 
             } else {
                 showScreen('game');
+                // 隱藏重置按鈕
+                document.getElementById('btn-host-reset').classList.add('hidden');
             }
 
             const roundDisplay = document.getElementById('round-display');
@@ -559,14 +609,11 @@
                 }
             }
             
-            // 使用 Atomic Updates 一次性更新所有資料（分數、歷史記錄、狀態）
             const updates = {};
             const round = currentGameState.round;
             const startTime = Date.now();
 
-            // 1. 記錄歷史 & 分數
             players.forEach(p => {
-                // 記錄本回合出價
                 updates[`players/${p.id}/bidHistory/${round}`] = p.currentBid || 0;
             });
 
@@ -576,7 +623,6 @@
                 updates[`players/${winnerId}/score`] = currentScore + 1;
             }
 
-            // 2. 更新遊戲狀態
             updates['gameState/phase'] = 'ROUND_RESULT';
             updates['gameState/startTime'] = startTime;
             updates['gameState/lastWinnerId'] = winnerId;
@@ -666,12 +712,10 @@
                     </div>
                  `).join('');
 
-                 // 淘汰者顯示
                  const loserContainer = document.getElementById('loser-container');
                  const historyContainer = document.getElementById('history-container');
                  
                  if (currentGameState.phase === 'GAME_OVER') {
-                     // 1. 顯示淘汰者
                      if (loserContainer) {
                          loserContainer.classList.remove('hidden');
                          const minScore = sortedByScore[sortedByScore.length - 1].score || 0;
@@ -679,7 +723,6 @@
                          const loserNames = losers.map(p => p.nickname).join(', ');
                          document.getElementById('loser-text').innerText = loserNames;
                      }
-                     // 2. 顯示詳細戰績表
                      if (historyContainer) {
                          historyContainer.classList.remove('hidden');
                          renderHistoryTable(list, GAME_CONFIG.totalRounds);
@@ -696,7 +739,6 @@
              const tableHead = document.getElementById('history-table-head');
              if (!tableBody || !tableHead) return;
 
-             // 1. 建立表頭 (R1, R2...)
              let headHtml = `<th class="px-2 py-1 sticky left-0 bg-gray-700 z-10 text-yellow-500">Player</th>`;
              headHtml += `<th class="px-2 py-1 bg-gray-700 min-w-[80px]">Rem. Time</th>`;
              for(let i=1; i<=totalRounds; i++) {
@@ -704,15 +746,11 @@
              }
              tableHead.innerHTML = `<tr>${headHtml}</tr>`;
 
-             // 2. 建立表格內容
              tableBody.innerHTML = players.map(p => {
                  let rowHtml = `<td class="px-2 py-1 sticky left-0 bg-gray-800 font-bold text-white border-r border-gray-600">${p.nickname}</td>`;
-                 // 剩餘時間
                  rowHtml += `<td class="px-2 py-1 text-green-400 font-mono">${(p.remainingTime || 0).toFixed(1)}</td>`;
-                 // 每一回合出價
                  for(let i=1; i<=totalRounds; i++) {
                      const bid = p.bidHistory && p.bidHistory[i] ? p.bidHistory[i] : 0;
-                     // 0 出價顯示為灰色 -
                      const displayBid = bid > 0 ? bid.toFixed(1) : '<span class="text-gray-600">-</span>';
                      rowHtml += `<td class="px-2 py-1 border-l border-gray-700 font-mono text-gray-300 text-center">${displayBid}</td>`;
                  }
@@ -734,16 +772,15 @@
             from { opacity: 0; }
             to { opacity: 1; }
         }
-        /* 美化 Input Number */
         input[type=number]::-webkit-inner-spin-button {
             opacity: 1;
         }
     </style>
 </head>
-<body class="bg-[#111] text-gray-100 h-screen w-screen overflow-hidden font-sans no-select" oncontextmenu="return false;">
+<body class="bg-[#111] text-gray-100 h-[100dvh] w-screen overflow-hidden font-sans no-select" oncontextmenu="return false;">
 
     <!-- Login -->
-    <div id="screen-login" class="flex flex-col items-center justify-center h-full p-6">
+    <div id="screen-login" class="flex flex-col items-center justify-center h-full p-6 overflow-y-auto">
         <h1 class="text-4xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-red-500 to-yellow-500 mb-8 tracking-tighter">TIME AUCTION</h1>
         <div class="w-full max-w-sm bg-zinc-900 p-6 rounded-xl border border-zinc-800 shadow-2xl">
             <label class="block text-gray-400 text-sm mb-2">ENTER NICKNAME</label>
@@ -753,9 +790,9 @@
         <p class="text-gray-600 text-xs mt-8">DEVIL'S PLAN SEASON 2 FAN MADE</p>
     </div>
 
-    <!-- Lobby -->
-    <div id="screen-lobby" class="hidden flex flex-col h-full p-6">
-        <div class="flex justify-between items-center mb-6">
+    <!-- Lobby (修正版：整體可捲動，確保底部按鈕可見) -->
+    <div id="screen-lobby" class="hidden flex flex-col h-full p-6 overflow-y-auto">
+        <div class="flex justify-between items-center mb-6 shrink-0">
             <button id="btn-leave" class="text-xs text-red-500 border border-red-900 px-3 py-1 rounded hover:bg-red-900/30 transition-colors">
                 LEAVE
             </button>
@@ -763,8 +800,8 @@
             <span id="host-indicator" class="hidden text-xs bg-yellow-900 text-yellow-200 px-2 py-1 rounded">YOU ARE HOST</span>
         </div>
         
-        <!-- Game Settings (New) -->
-        <div class="bg-zinc-900 p-4 rounded-lg border border-zinc-800 mb-4">
+        <!-- Game Settings -->
+        <div class="bg-zinc-900 p-4 rounded-lg border border-zinc-800 mb-4 shrink-0">
             <h3 class="text-xs text-gray-500 mb-3 uppercase tracking-wider">Game Settings</h3>
             <div class="grid grid-cols-2 gap-4">
                 <div>
@@ -782,25 +819,28 @@
             </div>
         </div>
         
-        <div id="lobby-status" class="text-center text-yellow-500 text-lg mb-4 font-mono h-8">WAITING FOR PLAYERS...</div>
+        <div id="lobby-status" class="text-center text-yellow-500 text-lg mb-4 font-mono h-8 shrink-0">WAITING FOR PLAYERS...</div>
         
-        <div id="lobby-player-list" class="flex-1 space-y-2 overflow-y-auto mb-6">
+        <!-- 玩家列表 (自然延伸，不強制 flex-1) -->
+        <div id="lobby-player-list" class="space-y-2 mb-6 w-full">
             <!-- List -->
         </div>
 
-        <!-- HOST START BUTTON -->
-        <button id="btn-host-start" class="hidden w-full mb-4 bg-yellow-600 border border-yellow-400 text-white py-4 rounded font-bold tracking-widest uppercase hover:bg-yellow-700 transition-all shadow-lg shadow-yellow-900/50">
-            START GAME
-        </button>
+        <!-- 底部按鈕區 (使用 margin-top auto 推到底部，但如果內容多則隨內容延伸) -->
+        <div class="mt-auto w-full space-y-4 shrink-0 pb-6">
+            <button id="btn-host-start" class="hidden w-full bg-yellow-600 border border-yellow-400 text-white py-4 rounded font-bold tracking-widest uppercase hover:bg-yellow-700 transition-all shadow-lg shadow-yellow-900/50">
+                START GAME
+            </button>
 
-        <button id="btn-ready" onclick="toggleReady()" class="w-full bg-zinc-800 border border-green-600 text-green-500 py-4 rounded font-bold tracking-widest uppercase hover:bg-green-900/20 transition-all">
-            I AM READY
-        </button>
+            <button id="btn-ready" onclick="toggleReady()" class="w-full bg-zinc-800 border border-green-600 text-green-500 py-4 rounded font-bold tracking-widest uppercase hover:bg-green-900/20 transition-all">
+                I AM READY
+            </button>
+        </div>
     </div>
 
     <!-- Game -->
     <div id="screen-game" class="hidden flex flex-col h-full relative">
-        <div class="bg-zinc-900 p-4 border-b border-zinc-800 flex justify-between items-center z-10">
+        <div class="bg-zinc-900 p-4 border-b border-zinc-800 flex justify-between items-center z-10 shrink-0">
             <span id="round-display" class="font-mono text-xl text-gray-300">ROUND 1 / 19</span>
             <span class="text-xs text-gray-500">HIDDEN TIMER</span>
         </div>
@@ -815,7 +855,7 @@
             <p class="text-gray-500 text-xs mt-2 font-mono">SECONDS STAKED</p>
         </div>
 
-        <div class="h-1/2 w-full p-6 pb-10 flex flex-col">
+        <div class="h-1/2 w-full p-6 pb-10 flex flex-col shrink-0">
             <button id="main-btn" class="flex-1 w-full bg-gray-600 rounded-2xl shadow-[0_0_30px_rgba(0,0,0,0.5)] border-4 border-white/10 text-2xl font-bold tracking-widest transition-all active:scale-[0.98] active:brightness-110 flex items-center justify-center text-white select-none touch-manipulation">
                 WAIT
             </button>
@@ -843,26 +883,26 @@
                     <!-- Standings -->
                 </div>
 
-                <!-- 淘汰者顯示區塊 -->
                 <div id="loser-container" class="hidden mt-4 pt-4 border-t border-zinc-700 text-center">
                     <h3 class="text-xs text-red-500 mb-1 uppercase tracking-widest">ELIMINATED</h3>
                     <div id="loser-text" class="text-xl font-bold text-red-600">
-                        <!-- Loser Name -->
                     </div>
                 </div>
             </div>
+
+            <!-- RESET BUTTON (HOST ONLY) -->
+            <button id="btn-host-reset" class="hidden w-full mb-8 bg-red-800 border border-red-600 text-white py-4 rounded font-bold tracking-widest uppercase hover:bg-red-900 transition-all shadow-lg">
+                PLAY AGAIN / RESET LOBBY
+            </button>
         </div>
 
-        <!-- 詳細戰績表 (新增) -->
         <div id="history-container" class="hidden w-full max-w-4xl mx-auto mt-6 mb-10">
             <h3 class="text-xs text-gray-500 mb-2 uppercase tracking-widest text-center">Match History</h3>
             <div class="overflow-x-auto bg-zinc-900 rounded border border-zinc-800 shadow-xl">
                 <table class="w-full text-xs text-left whitespace-nowrap">
                     <thead id="history-table-head" class="text-gray-400 bg-zinc-800 uppercase">
-                        <!-- Dynamic Header -->
                     </thead>
                     <tbody id="history-table-body" class="text-gray-300">
-                        <!-- Dynamic Body -->
                     </tbody>
                 </table>
             </div>
